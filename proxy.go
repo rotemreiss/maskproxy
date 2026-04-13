@@ -902,6 +902,17 @@ func rewriteCSP(csp, targetHost, rootDomain, proxyAddr string) string {
 			continue
 		}
 
+		// Drop the sandbox directive.  The CSP sandbox is equivalent to the
+		// <iframe sandbox> attribute and restricts powerful features like scripts,
+		// forms, and same-origin access.  Without 'allow-scripts' and
+		// 'allow-same-origin', the proxy's injected SPA script cannot run, and
+		// most JS-heavy pages break entirely.  Strip the whole directive so the
+		// proxy can operate normally; the sandboxing context is only meaningful
+		// for the original upstream deployment.
+		if name == "sandbox" {
+			continue
+		}
+
 		rewritten := make([]string, 0, len(tokens))
 		rewritten = append(rewritten, tokens[0]) // directive name unchanged
 		hadHash := false

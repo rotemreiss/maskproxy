@@ -3193,3 +3193,30 @@ func TestImportMapSubdomainRewrite(t *testing.T) {
 		t.Errorf("importmap /vendor/lodash.js not rewritten; got:\n%s", bs)
 	}
 }
+
+// TestCSPSandboxStripped verifies that the CSP sandbox directive is dropped
+// by rewriteCSP so proxy-injected scripts can run on sandboxed pages.
+func TestCSPSandboxStripped(t *testing.T) {
+cases := []struct {
+in   string
+want string
+desc string
+}{
+{
+in:   "sandbox; script-src 'self'",
+want: "script-src 'self'",
+desc: "standalone sandbox",
+},
+{
+in:   "script-src 'self'; sandbox allow-scripts; default-src 'none'",
+want: "script-src 'self'; default-src 'none'",
+desc: "sandbox with flags",
+},
+}
+for _, tc := range cases {
+got := rewriteCSP(tc.in, "example.com", "example.com", "localhost:9090")
+if got != tc.want {
+t.Errorf("rewriteCSP(%q) [%s]:\n got  %q\n want %q", tc.in, tc.desc, got, tc.want)
+}
+}
+}
