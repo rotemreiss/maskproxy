@@ -52,6 +52,10 @@ Options:
   -verbose                 Log every request and response with full headers and
                            a body preview (first 4 KiB).  Sensitive headers
                            (Authorization, Cookie, Set-Cookie) are redacted.
+  -ws-no-log               Suppress WebSocket frame logging.
+                           By default every WS frame opcode and payload length
+                           is logged to stderr so you can observe WS traffic.
+                           Use this flag to silence that output.
   -log          <path>     Append all log output to <path> in addition to stderr.
                            Works with both normal and -verbose mode.
   -port         <n>        Local port to listen on (default: 8080).
@@ -110,6 +114,7 @@ func main() {
 	exactDomain := flag.Bool("exact-domain", false, "Only mask the exact target host, not subdomains")
 	timeout := flag.Duration("timeout", 30*time.Second, "Upstream dial/TLS/response-header timeout (0 = no timeout)")
 	verbose := flag.Bool("verbose", false, "Log full request/response headers and body preview")
+	wsNoLog := flag.Bool("ws-no-log", false, "Suppress WebSocket frame logging (frames are logged by default)")
 	logFile := flag.String("log", "", "Append log output to this file in addition to stderr")
 	port := flag.Int("port", 8080, "Local port to listen on")
 	listen := flag.String("listen", "0.0.0.0", "Local listen address")
@@ -169,7 +174,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger, closeLog, err := NewLogger(*verbose, *logFile)
+	logger, closeLog, err := NewLogger(*verbose, !*wsNoLog, *logFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -220,6 +225,9 @@ func main() {
 	}
 	if *verbose {
 		logger.Printf("  → verbose logging enabled")
+	}
+	if *wsNoLog {
+		logger.Printf("  → WebSocket frame logging: disabled (-ws-no-log)")
 	}
 	if *logFile != "" {
 		logger.Printf("  → log file: %s", *logFile)

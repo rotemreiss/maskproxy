@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -605,6 +606,178 @@ func unmaskRequestString(s, targetHost, scheme, proxyAddr string) string {
 	return s
 }
 
+// ── WebSocket frame logging ───────────────────────────────────────────────────
+//
+// After a 101 Switching Protocols upgrade, httputil.ReverseProxy calls
+// Hijack() on both connections and copies raw bytes bidirectionally — no
+// middleware hook exists.  To observe WS frames we wrap the backend
+// ReadWriteCloser returned by the transport with wsLoggingConn, which parses
+// WS frame headers statefully as bytes stream through.
+
+// wsConnCounter assigns a monotonically increasing ID to each WebSocket
+// connection, making concurrent connections distinguishable in the log.
+var wsConnCounter atomic.Uint64
+
+// wsLoggingTransport wraps an http.RoundTripper and intercepts 101 Switching
+// Protocols responses to attach per-frame logging to the upgraded connection.
+type wsLoggingTransport struct {
+	rt     http.RoundTripper
+	logger *Logger
+}
+
+func (t *wsLoggingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.rt.RoundTrip(req)
+	if err != nil || resp == nil || resp.StatusCode != http.StatusSwitchingProtocols {
+		return resp, err
+	}
+	rwc, ok := resp.Body.(io.ReadWriteCloser)
+	if !ok {
+		// Body is not writable — httputil will handle the error; proceed without logging.
+		return resp, nil
+	}
+	id := wsConnCounter.Add(1)
+	t.logger.Printf("WS↕  conn#%d established", id)
+	resp.Body = &wsLoggingConn{rwc: rwc, id: id, logger: t.logger}
+	return resp, nil
+}
+
+// wsFrameParseState tracks the frame-header parser position for one direction
+// of a WebSocket connection.
+//
+// WS frame header layout (RFC 6455 §5.2):
+//
+//	Byte 0: FIN(1) RSV1-3(3) opcode(4)
+//	Byte 1: MASK(1) payload_len(7)
+//	  payload_len == 126 → 2 more bytes (uint16 big-endian)
+//	  payload_len == 127 → 8 more bytes (uint64 big-endian)
+//	  MASK bit set       → 4 masking-key bytes (after extended length)
+//	Then: payloadLen bytes of payload (not buffered — counted and skipped)
+type wsFrameParseState struct {
+	header     [14]byte // accumulates raw header bytes (max WS header size)
+	headerLen  int      // bytes collected so far
+	need       int      // total header bytes required for this frame
+	payloadRem uint64   // remaining payload bytes before the next frame header
+}
+
+// feed processes len(data) bytes that just passed through the connection.
+// It advances the parse state machine and calls logger.LogWSFrame once per
+// complete frame header encountered within data.
+//
+// Called from a single goroutine per direction (Read from one goroutine, Write
+// from another), so no locking is needed.
+func (s *wsFrameParseState) feed(data []byte, id uint64, dir string, logger *Logger) {
+	pos := 0
+	for pos < len(data) {
+		// Skip payload bytes belonging to the current frame.
+		if s.payloadRem > 0 {
+			avail := uint64(len(data) - pos)
+			skip := avail
+			if skip > s.payloadRem {
+				skip = s.payloadRem
+			}
+			s.payloadRem -= skip
+			pos += int(skip)
+			continue
+		}
+
+		// Accumulate header bytes one at a time.
+		s.header[s.headerLen] = data[pos]
+		s.headerLen++
+		pos++
+
+		switch s.headerLen {
+		case 1:
+			s.need = 2 // always need at least 2 bytes
+		case 2:
+			// Byte 1 tells us how many extended-length and masking-key bytes follow.
+			payLen7 := s.header[1] & 0x7F
+			masked := (s.header[1] & 0x80) != 0
+			s.need = 2
+			switch payLen7 {
+			case 126:
+				s.need += 2 // 16-bit extended payload length
+			case 127:
+				s.need += 8 // 64-bit extended payload length
+			}
+			if masked {
+				s.need += 4 // masking key
+			}
+		}
+
+		if s.headerLen < s.need {
+			continue // still accumulating header bytes
+		}
+
+		// Full header received — parse, log, and prepare to skip payload.
+		s.parseAndLog(id, dir, logger)
+	}
+}
+
+// parseAndLog extracts fields from the completed header buffer, emits a log
+// line, then resets the state for the next frame.
+func (s *wsFrameParseState) parseAndLog(id uint64, dir string, logger *Logger) {
+	fin := (s.header[0] & 0x80) != 0
+	opcode := s.header[0] & 0x0F
+	masked := (s.header[1] & 0x80) != 0
+	payLen7 := s.header[1] & 0x7F
+
+	var payloadLen uint64
+	switch payLen7 {
+	case 126:
+		payloadLen = uint64(s.header[2])<<8 | uint64(s.header[3])
+	case 127:
+		payloadLen = uint64(s.header[2])<<56 | uint64(s.header[3])<<48 |
+			uint64(s.header[4])<<40 | uint64(s.header[5])<<32 |
+			uint64(s.header[6])<<24 | uint64(s.header[7])<<16 |
+			uint64(s.header[8])<<8 | uint64(s.header[9])
+	default:
+		payloadLen = uint64(payLen7)
+	}
+	s.payloadRem = payloadLen
+
+	// Reset for the next frame.
+	s.headerLen = 0
+	s.need = 0
+
+	logger.LogWSFrame(id, dir, opcode, fin, masked, payloadLen)
+}
+
+// wsLoggingConn wraps the hijacked backend connection for a WebSocket upgrade.
+// It observes WS frame headers in both directions without buffering or
+// modifying any payload bytes (zero latency impact on the data stream).
+//
+// Thread safety: httputil's switchProtocolCopier calls Read and Write from
+// separate goroutines.  rstate and wstate are each accessed from exactly one
+// goroutine, so no mutex is needed.
+type wsLoggingConn struct {
+	rwc    io.ReadWriteCloser
+	id     uint64
+	logger *Logger
+	rstate wsFrameParseState // upstream→client (Read) parser
+	wstate wsFrameParseState // client→upstream (Write) parser
+}
+
+// Read passes bytes through unchanged and feeds them to the upstream→client parser.
+func (c *wsLoggingConn) Read(b []byte) (int, error) {
+	n, err := c.rwc.Read(b)
+	if n > 0 {
+		c.rstate.feed(b[:n], c.id, "WS↓", c.logger)
+	}
+	return n, err
+}
+
+// Write passes bytes through unchanged and feeds them to the client→upstream parser.
+func (c *wsLoggingConn) Write(b []byte) (int, error) {
+	n, err := c.rwc.Write(b)
+	if n > 0 {
+		c.wstate.feed(b[:n], c.id, "WS↑", c.logger)
+	}
+	return n, err
+}
+
+// Close closes the underlying connection.
+func (c *wsLoggingConn) Close() error { return c.rwc.Close() }
+
 // NewReverseProxy builds an httputil.ReverseProxy that fully masks the upstream
 // from the client:
 //
@@ -694,6 +867,15 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	if insecure {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // intentional for CTF
 		logger.Printf("maskproxy: WARNING — TLS certificate verification disabled (-skip-verify)")
+	}
+
+	// Wrap transport with WS frame logging when enabled.
+	// The wrapper intercepts 101 Switching Protocols responses and attaches a
+	// wsLoggingConn to the backend body so frame headers are logged in both
+	// directions without buffering or modifying the data stream.
+	var rt http.RoundTripper = transport
+	if logger.logWS {
+		rt = &wsLoggingTransport{rt: transport, logger: logger}
 	}
 
 	// reqTimes stores the start time recorded in the director so that
@@ -1039,7 +1221,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		Director:       director,
 		ModifyResponse: modifyResponse,
 		ErrorHandler:   errorHandler,
-		Transport:      transport,
+		Transport:      rt,
 		// FlushInterval=-1 enables immediate flushing (streaming mode).
 		// This is required for WebSocket and Server-Sent Events: when a client
 		// sends "Upgrade: websocket", httputil.ReverseProxy detects the 101

@@ -19,6 +19,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1197,3 +1198,275 @@ func TestProxyCSPRewrittenInResponse(t *testing.T) {
 		t.Errorf("CSP 'self' keyword was removed: %q", csp)
 	}
 }
+
+// ─── WebSocket frame logging ──────────────────────────────────────────────────
+
+// wsLogger returns a Logger that writes to a strings.Builder so tests can
+// inspect the log output.
+func wsLogger(buf *strings.Builder) *Logger {
+return &Logger{
+l:     log.New(buf, "", 0),
+logWS: true,
+}
+}
+
+// buildWSTextFrame builds a minimal unmasked FIN text frame (opcode 0x1).
+func buildWSTextFrame(payload string) []byte {
+p := []byte(payload)
+frame := make([]byte, 2+len(p))
+frame[0] = 0x81 // FIN + opcode=1 (text)
+frame[1] = byte(len(p))
+copy(frame[2:], p)
+return frame
+}
+
+// buildWSMaskedTextFrame builds a client-style masked FIN text frame.
+func buildWSMaskedTextFrame(payload string) []byte {
+p := []byte(payload)
+frame := make([]byte, 2+4+len(p))
+frame[0] = 0x81                     // FIN + opcode=1
+frame[1] = 0x80 | byte(len(p))      // MASK + len
+frame[2], frame[3], frame[4], frame[5] = 0xDE, 0xAD, 0xBE, 0xEF // mask key
+for i, b := range p {
+frame[6+i] = b ^ frame[2+i%4]
+}
+return frame
+}
+
+// buildWSBinaryFrame builds an unmasked FIN binary frame (opcode 0x2).
+func buildWSBinaryFrame(payload []byte) []byte {
+frame := make([]byte, 2+len(payload))
+frame[0] = 0x82 // FIN + opcode=2 (binary)
+frame[1] = byte(len(payload))
+copy(frame[2:], payload)
+return frame
+}
+
+// buildWS16BitFrame builds an unmasked FIN text frame with a 16-bit extended length.
+func buildWS16BitFrame(payloadLen int) []byte {
+frame := make([]byte, 2+2+payloadLen)
+frame[0] = 0x81 // FIN + text
+frame[1] = 126  // 16-bit extended length follows
+frame[2] = byte(payloadLen >> 8)
+frame[3] = byte(payloadLen)
+// payload is all zeros
+return frame
+}
+
+// buildWSPingFrame builds an unmasked FIN ping frame (opcode 0x9).
+func buildWSPingFrame() []byte {
+return []byte{0x89, 0x00} // FIN + ping, 0 payload bytes
+}
+
+// buildWSFragmentFrame builds a non-FIN text frame (first fragment, opcode 0x1).
+func buildWSFragmentFrame(payload string) []byte {
+p := []byte(payload)
+frame := make([]byte, 2+len(p))
+frame[0] = 0x01 // FIN=0 + opcode=1 (text)
+frame[1] = byte(len(p))
+copy(frame[2:], p)
+return frame
+}
+
+// TestWSFrameParserText verifies a simple unmasked text frame.
+func TestWSFrameParserText(t *testing.T) {
+var buf strings.Builder
+lg := wsLogger(&buf)
+var s wsFrameParseState
+
+frame := buildWSTextFrame("hello")
+s.feed(frame, 7, "WS↓", lg)
+
+got := buf.String()
+if !strings.Contains(got, "text") {
+t.Errorf("expected opcode 'text', got: %q", got)
+}
+if !strings.Contains(got, "len=5") {
+t.Errorf("expected len=5, got: %q", got)
+}
+if !strings.Contains(got, "conn#7") {
+t.Errorf("expected conn#7, got: %q", got)
+}
+if !strings.Contains(got, "WS↓") {
+t.Errorf("expected direction WS↓, got: %q", got)
+}
+}
+
+// TestWSFrameParserMasked verifies a masked (client→upstream) frame.
+func TestWSFrameParserMasked(t *testing.T) {
+var buf strings.Builder
+lg := wsLogger(&buf)
+var s wsFrameParseState
+
+frame := buildWSMaskedTextFrame("hi")
+s.feed(frame, 1, "WS↑", lg)
+
+got := buf.String()
+if !strings.Contains(got, "[masked]") {
+t.Errorf("expected [masked] flag, got: %q", got)
+}
+if !strings.Contains(got, "len=2") {
+t.Errorf("expected len=2, got: %q", got)
+}
+}
+
+// TestWSFrameParserPing verifies a ping control frame.
+func TestWSFrameParserPing(t *testing.T) {
+var buf strings.Builder
+lg := wsLogger(&buf)
+var s wsFrameParseState
+
+s.feed(buildWSPingFrame(), 1, "WS↓", lg)
+if !strings.Contains(buf.String(), "ping") {
+t.Errorf("expected 'ping', got: %q", buf.String())
+}
+}
+
+// TestWSFrameParserFragment verifies a non-FIN (fragment) frame is flagged.
+func TestWSFrameParserFragment(t *testing.T) {
+var buf strings.Builder
+lg := wsLogger(&buf)
+var s wsFrameParseState
+
+s.feed(buildWSFragmentFrame("part"), 1, "WS↓", lg)
+if !strings.Contains(buf.String(), "[fragment]") {
+t.Errorf("expected [fragment] flag, got: %q", buf.String())
+}
+}
+
+// TestWSFrameParser16BitLen verifies a frame with 16-bit extended payload length.
+func TestWSFrameParser16BitLen(t *testing.T) {
+var buf strings.Builder
+lg := wsLogger(&buf)
+var s wsFrameParseState
+
+s.feed(buildWS16BitFrame(300), 1, "WS↓", lg)
+if !strings.Contains(buf.String(), "len=300") {
+t.Errorf("expected len=300, got: %q", buf.String())
+}
+}
+
+// TestWSFrameParserChunked verifies correct parsing when frame bytes arrive in
+// tiny chunks (e.g. one byte at a time) — exercises cross-chunk header accumulation.
+func TestWSFrameParserChunked(t *testing.T) {
+var buf strings.Builder
+lg := wsLogger(&buf)
+var s wsFrameParseState
+
+frame := buildWSTextFrame("abc") // 5 bytes total
+// Feed one byte at a time.
+for _, b := range frame {
+s.feed([]byte{b}, 1, "WS↓", lg)
+}
+got := buf.String()
+if !strings.Contains(got, "text") {
+t.Errorf("expected 'text' after byte-by-byte feed, got: %q", got)
+}
+if !strings.Contains(got, "len=3") {
+t.Errorf("expected len=3, got: %q", got)
+}
+}
+
+// TestWSFrameParserMultipleFrames verifies that two frames concatenated in one
+// buffer are both parsed and logged.
+func TestWSFrameParserMultipleFrames(t *testing.T) {
+var buf strings.Builder
+lg := wsLogger(&buf)
+var s wsFrameParseState
+
+// Two frames back-to-back.
+data := append(buildWSTextFrame("hello"), buildWSPingFrame()...)
+s.feed(data, 1, "WS↓", lg)
+
+got := buf.String()
+if !strings.Contains(got, "text") {
+t.Errorf("expected 'text' frame, got: %q", got)
+}
+if !strings.Contains(got, "ping") {
+t.Errorf("expected 'ping' frame, got: %q", got)
+}
+}
+
+// TestLogWSFrameDisabled verifies that LogWSFrame is a no-op when logWS=false.
+func TestLogWSFrameDisabled(t *testing.T) {
+var buf strings.Builder
+lg := &Logger{l: log.New(&buf, "", 0), logWS: false}
+lg.LogWSFrame(1, "WS↓", 0x1, true, false, 5)
+if buf.String() != "" {
+t.Errorf("expected no output when logWS=false, got: %q", buf.String())
+}
+}
+
+// TestWSLoggingTransportWraps101 verifies that wsLoggingTransport replaces the
+// response body with a wsLoggingConn for 101 responses and logs the connection.
+func TestWSLoggingTransportWraps101(t *testing.T) {
+var buf strings.Builder
+lg := wsLogger(&buf)
+
+// // Use a pipe as a valid ReadWriteCloser.
+pr, pw := io.Pipe()
+go pw.Close()
+
+// Mock transport that returns 101 with a pipe as body.
+mockRT := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+return &http.Response{
+StatusCode: 101,
+Header:     make(http.Header),
+Body:       pipeRWC{pr, pw},
+}, nil
+})
+
+wlt := &wsLoggingTransport{rt: mockRT, logger: lg}
+req, _ := http.NewRequest("GET", "http://example.com/ws", nil)
+resp, err := wlt.RoundTrip(req)
+if err != nil {
+t.Fatal(err)
+}
+if _, ok := resp.Body.(*wsLoggingConn); !ok {
+t.Errorf("expected resp.Body to be *wsLoggingConn, got %T", resp.Body)
+}
+if !strings.Contains(buf.String(), "conn#") {
+t.Errorf("expected connection established log, got: %q", buf.String())
+}
+}
+
+// TestWSLoggingTransportPassesNon101 verifies that non-101 responses are
+// returned unchanged (no wrapping).
+func TestWSLoggingTransportPassesNon101(t *testing.T) {
+var buf strings.Builder
+lg := wsLogger(&buf)
+
+mockRT := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+return &http.Response{
+StatusCode: 200,
+Header:     make(http.Header),
+Body:       io.NopCloser(strings.NewReader("ok")),
+}, nil
+})
+
+wlt := &wsLoggingTransport{rt: mockRT, logger: lg}
+req, _ := http.NewRequest("GET", "http://example.com/", nil)
+resp, err := wlt.RoundTrip(req)
+if err != nil {
+t.Fatal(err)
+}
+if _, ok := resp.Body.(*wsLoggingConn); ok {
+t.Error("non-101 response body should NOT be wrapped")
+}
+}
+
+// pipeRWC wraps an io.PipeReader+Writer as an io.ReadWriteCloser so it
+// satisfies the interface that httputil expects for 101 response bodies.
+type pipeRWC struct {
+r *io.PipeReader
+w *io.PipeWriter
+}
+
+func (p pipeRWC) Read(b []byte) (int, error)  { return p.r.Read(b) }
+func (p pipeRWC) Write(b []byte) (int, error) { return p.w.Write(b) }
+func (p pipeRWC) Close() error                { p.w.Close(); return p.r.Close() }
+
+// roundTripFunc adapts a function to the http.RoundTripper interface.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }

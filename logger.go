@@ -30,15 +30,17 @@ var sensitiveHeaders = map[string]bool{
 //
 // Normal:  one line per request/response — method + URL + status + size + replacement count.
 // Verbose: the above plus all headers and a body preview (4 KiB).
+// logWS:   when true, one line per WebSocket frame header (opcode + payload length).
 type Logger struct {
 l       *log.Logger
 verbose bool
+logWS   bool
 }
 
 // NewLogger creates a Logger. If logPath is non-empty the file is opened in
 // append mode and all output is tee'd to it in addition to stderr.
 // The returned closer must be deferred in main to flush and close the file.
-func NewLogger(verbose bool, logPath string) (*Logger, func(), error) {
+func NewLogger(verbose bool, logWS bool, logPath string) (*Logger, func(), error) {
 writers := []io.Writer{os.Stderr}
 
 closer := func() {}
@@ -52,13 +54,13 @@ closer = func() { f.Close() }
 }
 
 l := log.New(io.MultiWriter(writers...), "", log.LstdFlags)
-return &Logger{l: l, verbose: verbose}, closer, nil
+return &Logger{l: l, verbose: verbose, logWS: logWS}, closer, nil
 }
 
 // newDiscardLogger returns a silent Logger that discards all output.
 // Used in unit tests to keep test output clean.
 func newDiscardLogger() *Logger {
-return &Logger{l: log.New(io.Discard, "", 0), verbose: false}
+return &Logger{l: log.New(io.Discard, "", 0), verbose: false, logWS: false}
 }
 
 // Printf formats and writes a message at normal level (always shown).
@@ -217,4 +219,36 @@ div *= unit
 exp++
 }
 return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// wsOpcodeNames maps the 4-bit WebSocket opcode to a human-readable name
+// (RFC 6455 §5.2).  Entries outside this table are printed as "0xN".
+var wsOpcodeNames = [16]string{
+0x0: "cont",
+0x1: "text",
+0x2: "binary",
+0x8: "close",
+0x9: "ping",
+0xA: "pong",
+}
+
+// LogWSFrame writes one log line describing a single WebSocket frame header.
+// dir is "WS↑" (client→upstream) or "WS↓" (upstream→client).
+// It is a no-op when logWS is false, so the caller need not guard the call.
+func (lg *Logger) LogWSFrame(connID uint64, dir string, opcode byte, fin, masked bool, payloadLen uint64) {
+if !lg.logWS {
+return
+}
+name := wsOpcodeNames[opcode]
+if name == "" {
+name = fmt.Sprintf("0x%X", opcode)
+}
+var extras strings.Builder
+if !fin {
+extras.WriteString(" [fragment]")
+}
+if masked {
+extras.WriteString(" [masked]")
+}
+lg.l.Printf("%s conn#%d  op=%-6s  len=%d%s", dir, connID, name, payloadLen, extras.String())
 }
