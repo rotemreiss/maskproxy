@@ -2617,3 +2617,94 @@ func TestClearSiteDataStripped(t *testing.T) {
 		t.Errorf("Clear-Site-Data not stripped: %q", v)
 	}
 }
+
+// TestPermissionsPolicyStripped verifies Permissions-Policy and Feature-Policy
+// are stripped.  These restrict browser APIs for the proxy's entire localhost
+// origin, affecting every site being proxied simultaneously.
+func TestPermissionsPolicyStripped(t *testing.T) {
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+w.Header().Set("Permissions-Policy", "camera=(), microphone=()")
+w.Header().Set("Feature-Policy", "vibrate 'none'")
+w.Header().Set("Content-Type", "text/html")
+fmt.Fprint(w, "<html></html>")
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("", false)
+proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+resp, err := http.Get(ps.URL + "/")
+if err != nil {
+t.Fatal(err)
+}
+resp.Body.Close()
+
+if v := resp.Header.Get("Permissions-Policy"); v != "" {
+t.Errorf("Permissions-Policy not stripped: %q", v)
+}
+if v := resp.Header.Get("Feature-Policy"); v != "" {
+t.Errorf("Feature-Policy not stripped: %q", v)
+}
+}
+
+// TestOriginAgentClusterStripped verifies Origin-Agent-Cluster is removed.
+func TestOriginAgentClusterStripped(t *testing.T) {
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+w.Header().Set("Origin-Agent-Cluster", "?1")
+w.Header().Set("Content-Type", "text/plain")
+fmt.Fprint(w, "ok")
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("", false)
+proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+resp, err := http.Get(ps.URL + "/")
+if err != nil {
+t.Fatal(err)
+}
+resp.Body.Close()
+
+if v := resp.Header.Get("Origin-Agent-Cluster"); v != "" {
+t.Errorf("Origin-Agent-Cluster not stripped: %q", v)
+}
+}
+
+// TestViaHeaderStripped verifies Via is removed from outbound requests and responses.
+func TestViaHeaderStripped(t *testing.T) {
+var sawVia string
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+sawVia = r.Header.Get("Via")
+w.Header().Set("Via", "1.1 cdn.example.com")
+w.Header().Set("Content-Type", "text/plain")
+fmt.Fprint(w, "ok")
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("", false)
+proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+req, _ := http.NewRequest("GET", ps.URL+"/", nil)
+req.Header.Set("Via", "1.1 client-proxy")
+resp, err := http.DefaultClient.Do(req)
+if err != nil {
+t.Fatal(err)
+}
+resp.Body.Close()
+
+if sawVia != "" {
+t.Errorf("Via forwarded to upstream: %q", sawVia)
+}
+if v := resp.Header.Get("Via"); v != "" {
+t.Errorf("Via not stripped from response: %q", v)
+}
+}

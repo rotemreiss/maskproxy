@@ -164,6 +164,10 @@ var headersStrip = map[string]bool{
 	// forwarding cross-origin subresources (images, fonts, etc.).
 	"Cross-Origin-Resource-Policy": true,
 
+	// Via: discloses proxy software and hop count to clients, unnecessarily
+	// revealing internal topology.  Strip from responses.
+	"Via": true,
+
 	// Service-Worker-Allowed: if set to "/", a service worker registered
 	// at /__sd__/<host>/sw.js could claim the entire proxy origin (including
 	// other subdomain routes), intercepting and potentially corrupting
@@ -185,6 +189,18 @@ var headersStrip = map[string]bool{
 	// validators so the browser never makes conditional requests for proxied pages.
 	"Etag":          true,
 	"Last-Modified": true,
+
+	// Permissions-Policy (formerly Feature-Policy): restricts browser APIs
+	// (camera, microphone, geolocation, payment, etc.) for the page's origin.
+	// Since all proxied sites share localhost:PORT, a restrictive policy from
+	// one site would apply globally to every other proxied site.  Strip it.
+	"Permissions-Policy": true,
+	"Feature-Policy":     true,
+
+	// Origin-Agent-Cluster: when set to "?1", the browser places the page in
+	// a separate agent cluster which may prevent certain cross-window
+	// interactions needed when multiple proxied pages interoperate.  Strip it.
+	"Origin-Agent-Cluster": true,
 }
 
 // textContentTypes lists MIME type prefixes for which body replacement is safe.
@@ -1330,6 +1346,9 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 
 		// Strip client-supplied X-Forwarded-For to prevent header injection.
 		req.Header.Del("X-Forwarded-For")
+
+		// Strip Via to avoid leaking proxy metadata to the upstream server.
+		req.Header.Del("Via")
 
 		// Strip conditional-request headers sent by the browser so the upstream
 		// always returns the full response body.  If we forwarded these and got
