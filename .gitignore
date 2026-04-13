@@ -1,0 +1,16 @@
+# Compiled binary
+ctfproxy
+ctfproxy.exe
+
+# QA artifacts (valuable but not part of the source)
+QA.md
+.playwright-cli/
+
+# Temp / test files
+/tmp/
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+*.swp
