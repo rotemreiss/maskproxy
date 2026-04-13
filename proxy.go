@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"crypto/tls"
 	"io"
@@ -1386,16 +1388,17 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			return nil
 		}
 
-		// Decompress gzip before string replacement.
+		// Decompress gzip or deflate before string replacement.
 		// We force Accept-Encoding: gzip, identity on all requests, so upstreams
-		// should not send other encodings. But CDNs sometimes ignore the header
-		// and respond with br (Brotli) or zstd. If we can't decode the encoding,
-		// skip body rewriting entirely to avoid corrupting the compressed bytes.
+		// should not send other encodings. But some servers ignore this and respond
+		// with deflate, br, or zstd. We handle gzip and deflate; anything else is
+		// forwarded unchanged to avoid corrupting compressed bytes.
 		var bodyReader io.Reader = resp.Body
 		ce := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
 		isGzip := ce == "gzip"
-		if !isGzip && ce != "" && ce != "identity" {
-			// Unknown encoding — forward body unchanged and skip rewriting.
+		isDeflate := ce == "deflate"
+		if !isGzip && !isDeflate && ce != "" && ce != "identity" {
+			// Unknown encoding (br, zstd, …) — forward body unchanged and skip rewriting.
 			logger.Printf("maskproxy: skipping body rewrite: unsupported Content-Encoding %q", ce)
 			logger.LogResponse(resp, "", start, 0)
 			return nil
@@ -1409,6 +1412,33 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			}
 			defer gz.Close()
 			bodyReader = gz
+			resp.Header.Del("Content-Encoding")
+		}
+		if isDeflate {
+			// HTTP "deflate" is ambiguous: some servers send zlib-wrapped DEFLATE
+			// (RFC 1950), others send raw DEFLATE (RFC 1951). Try zlib first; if
+			// the header bytes don't match (0x78 magic), fall back to raw flate.
+			// Buffer the body so we can re-read on fallback.
+			compressed, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+			if err != nil {
+				return err
+			}
+			var dr io.ReadCloser
+			if len(compressed) >= 2 && compressed[0] == 0x78 {
+				dr, err = zlib.NewReader(bytes.NewReader(compressed))
+			} else {
+				dr = flate.NewReader(bytes.NewReader(compressed))
+				err = nil
+			}
+			if err != nil {
+				logger.Printf("maskproxy: failed to decode deflate response: %v", err)
+				// Restore original body and skip rewriting.
+				resp.Body = io.NopCloser(bytes.NewReader(compressed))
+				logger.LogResponse(resp, "", start, 0)
+				return nil
+			}
+			defer dr.Close()
+			bodyReader = dr
 			resp.Header.Del("Content-Encoding")
 		}
 

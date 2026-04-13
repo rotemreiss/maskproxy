@@ -18,6 +18,8 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/zlib"
 	"fmt"
 	"io"
 	"log"
@@ -2101,5 +2103,72 @@ func TestUnknownContentEncodingSkipsRewrite(t *testing.T) {
 	// Content-Encoding must still be present.
 	if ce := resp.Header.Get("Content-Encoding"); ce != "br" {
 		t.Errorf("Content-Encoding = %q; want %q", ce, "br")
+	}
+}
+
+// TestDeflateResponseBodyRewrite verifies that deflate-encoded responses are
+// correctly decompressed, string replacements applied, and Content-Encoding stripped.
+// Both zlib-wrapped and raw-deflate variants are tested.
+func TestDeflateResponseBodyRewrite(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		encode func([]byte) []byte
+	}{
+		{
+			name: "zlib-wrapped deflate",
+			encode: func(plain []byte) []byte {
+				var buf bytes.Buffer
+				w := zlib.NewWriter(&buf)
+				w.Write(plain)
+				w.Close()
+				return buf.Bytes()
+			},
+		},
+		{
+			name: "raw deflate (no zlib header)",
+			encode: func(plain []byte) []byte {
+				var buf bytes.Buffer
+				w, _ := flate.NewWriter(&buf, flate.DefaultCompression)
+				w.Write(plain)
+				w.Close()
+				return buf.Bytes()
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plainBody := "Welcome to ctf! Visit ctf.io for ctf challenges."
+			compressed := tc.encode([]byte(plainBody))
+
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/html")
+				w.Header().Set("Content-Encoding", "deflate")
+				w.Write(compressed)
+			}))
+			defer upstream.Close()
+
+			host := strings.TrimPrefix(upstream.URL, "http://")
+			rep, _ := NewReplacer("ctf:acme", false)
+			proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil, 0)
+			ps := httptest.NewServer(proxy)
+			defer ps.Close()
+
+			resp, err := ps.Client().Get(ps.URL + "/page")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+
+			got := string(body)
+			if strings.Contains(got, "ctf") {
+				t.Errorf("replacements not applied; body still contains 'ctf': %q", got)
+			}
+			if !strings.Contains(got, "acme") {
+				t.Errorf("replacements not applied; body missing 'acme': %q", got)
+			}
+			if ce := resp.Header.Get("Content-Encoding"); ce != "" {
+				t.Errorf("Content-Encoding not stripped; got %q", ce)
+			}
+		})
 	}
 }
