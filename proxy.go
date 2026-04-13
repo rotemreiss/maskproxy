@@ -120,6 +120,7 @@ var headersStrip = map[string]bool{
 // avoid corrupting them.
 var textContentTypes = []string{
 	"text/",
+	"image/svg+xml",            // SVG is XML text; may contain href/url() referencing upstream hosts
 	"application/json",
 	"application/manifest+json", // PWA web app manifests (start_url, icons, etc.)
 	"application/xml",

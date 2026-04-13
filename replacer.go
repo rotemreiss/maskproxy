@@ -33,6 +33,11 @@ type Replacer struct {
 	// nil when there are no pairs or only one pair (fallback to strings.ReplaceAll).
 	reReq  *regexp.Regexp
 	reResp *regexp.Regexp
+	// lookupReq / lookupResp are pre-built dispatch tables for ReplaceAllStringFunc.
+	// Keys are lowercased when caseInsensitive is true.  Built once in NewReplacer
+	// to avoid per-call allocations on the hot path.
+	lookupReq  map[string]string
+	lookupResp map[string]string
 }
 
 // NewReplacer parses the -replace flag value (e.g. "ctf:acme,ctfd:foo").
@@ -73,11 +78,29 @@ func NewReplacer(spec string, caseInsensitive bool) (*Replacer, error) {
 	// Compile single-pass regexps.  A single alternation scan prevents cascading
 	// rewrites where the alias of one pair contains the key of another pair
 	// (e.g. wikipedia→wikifake then wiki→wf would corrupt wikifake→wffake).
+	// Also pre-build dispatch lookup tables so ReplaceAllStringFunc never needs
+	// to allocate a new map on the hot path (called for every proxied body).
 	if len(r.forRequest) > 0 {
 		r.reReq = buildRegexp(r.forRequest, "Alias", caseInsensitive)
+		r.lookupReq = make(map[string]string, len(r.forRequest))
+		for _, p := range r.forRequest {
+			key := p.Alias
+			if caseInsensitive {
+				key = strings.ToLower(key)
+			}
+			r.lookupReq[key] = p.Original
+		}
 	}
 	if len(r.forResponse) > 0 {
 		r.reResp = buildRegexp(r.forResponse, "Original", caseInsensitive)
+		r.lookupResp = make(map[string]string, len(r.forResponse))
+		for _, p := range r.forResponse {
+			key := p.Original
+			if caseInsensitive {
+				key = strings.ToLower(key)
+			}
+			r.lookupResp[key] = p.Alias
+		}
 	}
 
 	return r, nil
@@ -111,21 +134,12 @@ func replaceCI(s, old, newVal string) string {
 // Used when rewriting outbound requests (client aliases → server originals).
 func (r *Replacer) ToOriginal(s string) string {
 	if r.reReq != nil {
-		// Build lookup for O(1) dispatch inside ReplaceAllStringFunc.
-		lookup := make(map[string]string, len(r.forRequest))
-		for _, p := range r.forRequest {
-			key := p.Alias
-			if r.caseInsensitive {
-				key = strings.ToLower(key)
-			}
-			lookup[key] = p.Original
-		}
 		return r.reReq.ReplaceAllStringFunc(s, func(m string) string {
 			key := m
 			if r.caseInsensitive {
 				key = strings.ToLower(key)
 			}
-			if v, ok := lookup[key]; ok {
+			if v, ok := r.lookupReq[key]; ok {
 				return v
 			}
 			return m
@@ -146,20 +160,12 @@ func (r *Replacer) ToOriginal(s string) string {
 // Used when rewriting inbound responses (server originals → client aliases).
 func (r *Replacer) ToAlias(s string) string {
 	if r.reResp != nil {
-		lookup := make(map[string]string, len(r.forResponse))
-		for _, p := range r.forResponse {
-			key := p.Original
-			if r.caseInsensitive {
-				key = strings.ToLower(key)
-			}
-			lookup[key] = p.Alias
-		}
 		return r.reResp.ReplaceAllStringFunc(s, func(m string) string {
 			key := m
 			if r.caseInsensitive {
 				key = strings.ToLower(key)
 			}
-			if v, ok := lookup[key]; ok {
+			if v, ok := r.lookupResp[key]; ok {
 				return v
 			}
 			return m
@@ -185,20 +191,12 @@ func (r *Replacer) HasPairs() bool {
 func (r *Replacer) ToOriginalDiff(s string) (string, int) {
 	count := 0
 	if r.reReq != nil {
-		lookup := make(map[string]string, len(r.forRequest))
-		for _, p := range r.forRequest {
-			key := p.Alias
-			if r.caseInsensitive {
-				key = strings.ToLower(key)
-			}
-			lookup[key] = p.Original
-		}
 		result := r.reReq.ReplaceAllStringFunc(s, func(m string) string {
 			key := m
 			if r.caseInsensitive {
 				key = strings.ToLower(key)
 			}
-			if v, ok := lookup[key]; ok {
+			if v, ok := r.lookupReq[key]; ok {
 				count++
 				return v
 			}
@@ -227,20 +225,12 @@ func (r *Replacer) ToOriginalDiff(s string) (string, int) {
 func (r *Replacer) ToAliasDiff(s string) (string, int) {
 	count := 0
 	if r.reResp != nil {
-		lookup := make(map[string]string, len(r.forResponse))
-		for _, p := range r.forResponse {
-			key := p.Original
-			if r.caseInsensitive {
-				key = strings.ToLower(key)
-			}
-			lookup[key] = p.Alias
-		}
 		result := r.reResp.ReplaceAllStringFunc(s, func(m string) string {
 			key := m
 			if r.caseInsensitive {
 				key = strings.ToLower(key)
 			}
-			if v, ok := lookup[key]; ok {
+			if v, ok := r.lookupResp[key]; ok {
 				count++
 				return v
 			}

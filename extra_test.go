@@ -62,7 +62,7 @@ func TestIsTextContent(t *testing.T) {
 		{"image/png", false},
 		{"image/jpeg", false},
 		{"image/gif", false},
-		{"image/svg+xml", false},
+		{"image/svg+xml", true},   // SVG is XML text; may contain href/url() referencing upstream hosts
 		{"image/webp", false},
 		{"video/mp4", false},
 		{"audio/mpeg", false},
