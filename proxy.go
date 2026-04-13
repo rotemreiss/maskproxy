@@ -1107,6 +1107,13 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			start = v.(time.Time)
 		}
 
+		// Short-circuit for SSRF-blocked responses: the synthetic 403 body from
+		// ssrfGuardTransport needs no host masking or string replacement.
+		if _, blocked := resp.Request.Context().Value(ssrfBlockedKey{}).(string); blocked {
+			logger.LogResponse(resp, "", start, 0)
+			return nil
+		}
+
 		// Per-request effective proxy address: use the client-facing Host that
 		// the browser sent (captured in the director via context) so that rewritten
 		// URLs in the response body and Location headers use the same hostname
