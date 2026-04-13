@@ -2929,6 +2929,15 @@ func TestSubdomainSPAScriptInjected(t *testing.T) {
 	if !strings.Contains(bodyStr, "EventSource") {
 		t.Errorf("EventSource patching not found in injected script:\n%s", bodyStr)
 	}
+	if !strings.Contains(bodyStr, "sendBeacon") {
+		t.Errorf("sendBeacon patching not found in injected script:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `'assign','replace'`) && !strings.Contains(bodyStr, `"assign","replace"`) {
+		t.Errorf("location.assign/replace patching not found in injected script:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "serviceWorker") {
+		t.Errorf("serviceWorker block not found in injected script:\n%s", bodyStr)
+	}
 }
 
 // TestSubdomainSPAScriptNonceInjected verifies that when the page has existing

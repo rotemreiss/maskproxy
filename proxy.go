@@ -133,12 +133,79 @@ const maxBodyRewriteDefault = int64(50 * 1024 * 1024) // 50 MiB
 // Fix: patch the browser's visible URL with history.replaceState so the SPA
 // router sees "/path" instead of "/__sd__/<host>/path".  Also patch
 // history.pushState / replaceState to transparently re-add the proxy prefix so
-// that subsequent SPA navigations stay routed through /__sd__/<host>/.  Fetch
-// and XHR root-relative calls are likewise prefixed so API requests don't
-// accidentally route to the main proxy target.
+// that subsequent SPA navigations stay routed through /__sd__/<host>/.  Fetch,
+// XHR, WebSocket, and EventSource root-relative calls are likewise prefixed so
+// API/socket requests don't accidentally route to the main proxy target.
+//
+// Additional hardening:
+//   - navigator.sendBeacon: root-relative analytics beacons would otherwise
+//     hit the main proxy target instead of the subdomain.
+//   - location.assign / location.replace: full-page navigations to root-relative
+//     paths would load the main proxy target; prefix them so they stay on the
+//     subdomain route.
+//   - navigator.serviceWorker.register: a SW registered from a subdomain page
+//     at scope "/" would intercept ALL requests on localhost:PORT — including
+//     other proxied sites.  Block SW registration entirely from subdomain pages.
 //
 // %s is replaced with the /__sd__/<host> prefix (e.g. "/__sd__/copilot.microsoft.com").
-const subdomainSPAScript = `<script>(function(){var pfx=%q;if(!location.pathname.startsWith(pfx))return;var path=location.pathname.slice(pfx.length)||'/';history.replaceState(history.state,document.title,path+location.search+location.hash);['pushState','replaceState'].forEach(function(fn){var o=history[fn].bind(history);history[fn]=function(st,ti,url){if(typeof url==='string'&&url.startsWith('/')&&!url.startsWith('/__sd__/'))url=pfx+url;return o(st,ti,url);};});var oF=window.fetch;window.fetch=function(i,o){if(typeof i==='string'&&i.startsWith('/')&&!i.startsWith('/__sd__/'))i=pfx+i;return oF.call(this,i,o);};var oX=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/'))u=pfx+u;return oX.apply(this,arguments);};var WS=window.WebSocket;window.WebSocket=function(u,p){if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/')){var sch=location.protocol==='https:'?'wss://':'ws://';u=sch+location.host+pfx+u;}return p!==undefined?new WS(u,p):new WS(u);};window.WebSocket.prototype=WS.prototype;if(window.EventSource){var ES=window.EventSource;window.EventSource=function(u,o){if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/'))u=pfx+u;return o!==undefined?new ES(u,o):new ES(u);};}})();</script>`
+const subdomainSPAScript = `<script>(function(){` +
+	`var pfx=%q;` +
+	`if(!location.pathname.startsWith(pfx))return;` +
+	// Patch visible URL so SPA routers see the real path.
+	`var path=location.pathname.slice(pfx.length)||'/';` +
+	`history.replaceState(history.state,document.title,path+location.search+location.hash);` +
+	// Patch pushState/replaceState to re-add the prefix on navigation.
+	`['pushState','replaceState'].forEach(function(fn){` +
+	`var o=history[fn].bind(history);` +
+	`history[fn]=function(st,ti,url){` +
+	`if(typeof url==='string'&&url.startsWith('/')&&!url.startsWith('/__sd__/'))url=pfx+url;` +
+	`return o(st,ti,url);};});` +
+	// Patch location.assign / location.replace for full-page navigations.
+	`['assign','replace'].forEach(function(fn){` +
+	`var o=location[fn].bind(location);` +
+	`location[fn]=function(url){` +
+	`if(typeof url==='string'&&url.startsWith('/')&&!url.startsWith('/__sd__/'))url=pfx+url;` +
+	`return o(url);};});` +
+	// Patch window.fetch for root-relative API calls.
+	`var oF=window.fetch;` +
+	`window.fetch=function(i,o){` +
+	`if(typeof i==='string'&&i.startsWith('/')&&!i.startsWith('/__sd__/'))i=pfx+i;` +
+	`return oF.call(this,i,o);};` +
+	// Patch XMLHttpRequest.open for root-relative XHR calls.
+	`var oX=XMLHttpRequest.prototype.open;` +
+	`XMLHttpRequest.prototype.open=function(m,u){` +
+	`if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/'))u=pfx+u;` +
+	`return oX.apply(this,arguments);};` +
+	// Patch navigator.sendBeacon for root-relative analytics/telemetry.
+	`if(navigator.sendBeacon){` +
+	`var oB=navigator.sendBeacon.bind(navigator);` +
+	`navigator.sendBeacon=function(u,d){` +
+	`if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/'))u=pfx+u;` +
+	`return oB(u,d);};` +
+	`}` +
+	// Patch WebSocket for root-relative WS connections.
+	`var WS=window.WebSocket;` +
+	`window.WebSocket=function(u,p){` +
+	`if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/')){` +
+	`var sch=location.protocol==='https:'?'wss://':'ws://';` +
+	`u=sch+location.host+pfx+u;}` +
+	`return p!==undefined?new WS(u,p):new WS(u);};` +
+	`window.WebSocket.prototype=WS.prototype;` +
+	// Patch EventSource for root-relative SSE streams.
+	`if(window.EventSource){` +
+	`var ES=window.EventSource;` +
+	`window.EventSource=function(u,o){` +
+	`if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/'))u=pfx+u;` +
+	`return o!==undefined?new ES(u,o):new ES(u);};` +
+	`}` +
+	// Block Service Worker registration: a SW at scope "/" would intercept ALL
+	// requests on localhost:PORT — including requests from other proxied sites —
+	// silently corrupting or logging cross-site traffic.
+	`if(navigator.serviceWorker){` +
+	`navigator.serviceWorker.register=function(){` +
+	`return Promise.reject(new Error('SW blocked by proxy'));};` +
+	`}` +
+	`})();</script>`
 
 // headTagRe matches an opening <head> tag (with optional attributes) to find
 // the injection point for the subdomain SPA script.
