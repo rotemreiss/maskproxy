@@ -2172,3 +2172,48 @@ func TestDeflateResponseBodyRewrite(t *testing.T) {
 		})
 	}
 }
+
+// TestDeflateOversizedBodyRestored verifies that when a deflate-encoded response
+// body exceeds maxBodyBytes (set to 1 byte via -max-body 0 trick won't work;
+// use a direct unit test instead), the original compressed bytes and
+// Content-Encoding header are restored intact.
+func TestDeflateOversizedBodyRestored(t *testing.T) {
+plain := []byte("hello ctf world")
+
+// Compress with zlib (deflate variant).
+var compressed bytes.Buffer
+zw := zlib.NewWriter(&compressed)
+zw.Write(plain)
+zw.Close()
+compressedBytes := compressed.Bytes()
+
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+w.Header().Set("Content-Type", "text/html")
+w.Header().Set("Content-Encoding", "deflate")
+w.Write(compressedBytes)
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("ctf:acme", false)
+// Set maxBodyBytes to 1 so the body always exceeds the limit.
+proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil, 1)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+resp, err := ps.Client().Get(ps.URL + "/page")
+if err != nil {
+t.Fatal(err)
+}
+defer resp.Body.Close()
+body, _ := io.ReadAll(resp.Body)
+
+// Content-Encoding must be restored.
+if ce := resp.Header.Get("Content-Encoding"); ce != "deflate" {
+t.Errorf("Content-Encoding = %q; want %q", ce, "deflate")
+}
+// Body must be the original compressed bytes (not decompressed, not modified).
+if !bytes.Equal(body, compressedBytes) {
+t.Errorf("body was not restored: got %d bytes, want %d bytes (original compressed)", len(body), len(compressedBytes))
+}
+}

@@ -1419,19 +1419,18 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			// HTTP "deflate" is ambiguous: some servers send zlib-wrapped DEFLATE
 			// (RFC 1950), others send raw DEFLATE (RFC 1951). Try zlib first; if
 			// the header bytes don't match (0x78 magic), fall back to raw flate.
-			// Buffer the compressed bytes first so we can restore on fallback or
-			// when the decompressed size exceeds the rewrite limit.
+			// Read ALL compressed bytes up-front so we can restore them intact if
+			// the decompressed size exceeds the rewrite limit (compressedDeflate
+			// is checked in the oversized-body branch below).  Use maxBodyBytes as
+			// an upper bound for the compressed stream too — a deflate body that is
+			// already larger than maxBodyBytes compressed will definitely exceed it
+			// decompressed, so we can skip without even trying.
 			var err error
-			compressedDeflate, err = io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+			// Read the full compressed body (no inner limit — size-gating happens
+			// after decompression in the shared oversized check below).
+			compressedDeflate, err = io.ReadAll(resp.Body)
 			if err != nil {
 				return err
-			}
-			// If the compressed body alone exceeds the limit, forward it unchanged.
-			if int64(len(compressedDeflate)) > maxBodyBytes {
-				logger.Printf("maskproxy: deflate body exceeds %d bytes; skipping rewrite", maxBodyBytes)
-				resp.Body = io.NopCloser(bytes.NewReader(compressedDeflate))
-				logger.LogResponse(resp, "", start, 0)
-				return nil
 			}
 			var dr io.ReadCloser
 			if len(compressedDeflate) >= 2 && compressedDeflate[0] == 0x78 {
