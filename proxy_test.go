@@ -566,3 +566,104 @@ func TestMaskResponseStringExactDomainNoSubdomainRe(t *testing.T) {
 		}
 	}
 }
+
+// ---- Bug-fix regression tests ----
+
+// TestSSRFBlockedViaSdPath verifies that /__sd__/<host> requests for hosts that
+// are NOT under the rootDomain are blocked and do not proxy to arbitrary hosts.
+func TestSSRFBlockedViaSdPath(t *testing.T) {
+	// Upstream that the SSRF would reach — should never receive a request.
+	ssrfTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("SSRF: request reached forbidden host %s", r.Host)
+		fmt.Fprint(w, "ssrf")
+	}))
+	defer ssrfTarget.Close()
+
+	// Legitimate upstream.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", false, testLogger())
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	// Attempt SSRF: request targets a host that is not under the upstream's root domain.
+	ssrfHost := strings.TrimPrefix(ssrfTarget.URL, "http://")
+	resp, err := ps.Client().Get(ps.URL + "/__sd__/" + ssrfHost + "/secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	// The proxy should not have forwarded to the ssrfTarget (tested via t.Errorf above),
+	// and should return some non-5xx response (it re-routes to the main target).
+	if resp.StatusCode == 0 {
+		t.Errorf("expected a response, got status 0")
+	}
+}
+
+// TestSdHostNotCorruptedByUserReplace verifies that user alias replacements do not
+// corrupt the upstream hostname encoded in a /__sd__/<host>/ path segment.
+//
+// E.g. -replace ynet:news must NOT turn /__sd__/www.ynet.co.il/ into
+// /__sd__/www.news.co.il/ — the encoded host must survive intact.
+func TestSdHostNotCorruptedByUserReplace(t *testing.T) {
+	// Simulate a response body that maskResponseString has already processed —
+	// subdomain URLs have been encoded as /__sd__/<host>/path.
+	body := `<html><a href="http://localhost:9000/__sd__/api.ynet.co.il/data">link</a>` +
+		`<p>Visit ynet for news</p></html>`
+
+	rep, err := NewReplacer("ynet:news", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// withExternalURLsProtected must shield /__sd__/ host segments so
+	// the "ynet" inside "api.ynet.co.il" is NOT replaced with "news".
+	result := withExternalURLsProtected(body, "http://localhost:9000", rep.ToAlias)
+
+	// The /__sd__/ host must be unchanged.
+	if strings.Contains(result, "/__sd__/api.news.co.il/") {
+		t.Errorf("user replace corrupted /__sd__/ host segment: %q", result)
+	}
+	if !strings.Contains(result, "/__sd__/api.ynet.co.il/") {
+		t.Errorf("/__sd__/api.ynet.co.il/ was lost from body: %q", result)
+	}
+
+	// The free-text "ynet" outside the /__sd__/ segment SHOULD be replaced.
+	if !strings.Contains(result, "Visit news for") {
+		t.Errorf("expected free-text 'ynet' → 'news' replacement in body: %q", result)
+	}
+}
+
+// TestHEADRequestNoGzipError verifies that a HEAD response with Content-Encoding: gzip
+// does not trigger a spurious "failed to decode gzip" error and returns cleanly.
+func TestHEADRequestNoGzipError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Real servers may send Content-Encoding on HEAD even though there is no body.
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+		// No body — correct behaviour per HTTP spec for HEAD.
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", false, testLogger())
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	req, _ := http.NewRequest(http.MethodHead, ps.URL+"/", nil)
+	resp, err := ps.Client().Do(req)
+	if err != nil {
+		t.Fatalf("HEAD request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}

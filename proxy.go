@@ -91,9 +91,24 @@ var textContentTypes = []string{
 // Mechanism: each protected URL is temporarily replaced with a NUL-delimited
 // numeric placeholder, fn is applied to the surrounding text, and then every
 // placeholder is swapped back to the original URL.
+//
+// Additionally, /__sd__/<host> segments within proxy-local URLs are specifically
+// shielded so that user string replacements cannot corrupt the encoded upstream
+// hostname (e.g. "ynet" in "/__sd__/www.ynet.co.il/" must not become "news").
 func withExternalURLsProtected(s, proxyBase string, fn func(string) string) string {
 	type entry struct{ placeholder, original string }
 	var saved []entry
+
+	// Step 1: shield /__sd__/<host> segments BEFORE the external-URL scan.
+	// These encoded upstream hosts live inside proxy-local URLs and must survive
+	// user replacements intact so the director can route correctly.
+	s = subdomainPathRe.ReplaceAllStringFunc(s, func(m string) string {
+		ph := "\x01" + strconv.Itoa(len(saved)) + "\x01"
+		saved = append(saved, entry{ph, m})
+		return ph
+	})
+
+	// Step 2: shield external (non-proxy) URLs.
 	result := absURLRe.ReplaceAllStringFunc(s, func(u string) string {
 		// Keep proxy-local URLs unprotected so their paths are still rewritten.
 		// Check both "http://host" and "//host" (protocol-relative) forms.
@@ -107,9 +122,14 @@ func withExternalURLsProtected(s, proxyBase string, fn func(string) string) stri
 		saved = append(saved, entry{ph, u})
 		return ph
 	})
+
+	// Step 3: apply user replacements to everything not shielded.
 	result = fn(result)
-	for _, e := range saved {
-		result = strings.Replace(result, e.placeholder, e.original, 1)
+
+	// Step 4: restore all shielded segments in reverse-insertion order so that
+	// nested or overlapping placeholders resolve correctly.
+	for i := len(saved) - 1; i >= 0; i-- {
+		result = strings.Replace(result, saved[i].placeholder, saved[i].original, 1)
 	}
 	return result
 }
@@ -423,6 +443,10 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		//
 		//   "/__sd__/assets.example.com/foo.js" → GET /foo.js to assets.example.com
 		//   "/__sd__/api.example.com/v2/data"   → GET /v2/data to api.example.com
+		//
+		// Security: we validate that the extracted host is actually a subdomain of
+		// rootDomain.  Without this check any client could use /__sd__/evil.com/ to
+		// proxy requests to arbitrary external hosts (SSRF).
 		if strings.HasPrefix(req.URL.Path, subdomainPrefix) {
 			rest := req.URL.Path[len(subdomainPrefix):]
 			subHost := rest
@@ -431,11 +455,27 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 				subHost = rest[:i]
 				subPath = rest[i:]
 			}
-			req.URL.Host = subHost
-			req.Host = subHost
-			req.URL.Path = subPath
-			// Clear RawPath to avoid inconsistency; it will be recomputed if needed.
-			req.URL.RawPath = ""
+			// Validate: subHost must be the rootDomain itself, or a subdomain of it.
+			// A valid subdomain satisfies: strings.HasSuffix(subHost, "."+rootDomain)
+			// OR subHost == rootDomain (bare root, no subdomain label).
+			subHostLower := strings.ToLower(subHost)
+			rootLower := strings.ToLower(rootDomain)
+			validSubdomain := subHostLower == rootLower ||
+				strings.HasSuffix(subHostLower, "."+rootLower)
+			if !validSubdomain {
+				// Route to the main target and drop the /__sd__ prefix — this prevents
+				// SSRF while still serving a (possibly wrong) response rather than a
+				// hard 400 that could break page loads if a stale URL slips through.
+				logger.Printf("maskproxy: blocked SSRF attempt via /__sd__/%s (not under %s)", subHost, rootDomain)
+				req.URL.Path = subPath
+				req.URL.RawPath = ""
+			} else {
+				req.URL.Host = subHost
+				req.Host = subHost
+				req.URL.Path = subPath
+				// Clear RawPath to avoid inconsistency; it will be recomputed if needed.
+				req.URL.RawPath = ""
+			}
 		}
 
 		// Rewrite request headers in a single pass:
@@ -547,6 +587,18 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		contentType := resp.Header.Get("Content-Type")
 		if !isTextContent(contentType) {
 			// Log before returning — no body snapshot for binary content.
+			logger.LogResponse(resp, "", start)
+			return nil
+		}
+
+		// HEAD, 204 No Content, and 304 Not Modified responses have no body.
+		// The upstream may still send Content-Encoding: gzip (describing what the
+		// body *would* have been), so we must skip gzip decoding here to avoid
+		// "failed to decode gzip response: EOF" noise in the logs.
+		noBody := resp.Request.Method == http.MethodHead ||
+			resp.StatusCode == http.StatusNoContent ||
+			resp.StatusCode == http.StatusNotModified
+		if noBody {
 			logger.LogResponse(resp, "", start)
 			return nil
 		}
