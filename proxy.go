@@ -659,6 +659,19 @@ func rewriteCSP(csp, targetHost, rootDomain, proxyAddr string) string {
 	directives := strings.Split(csp, ";")
 	out := make([]string, 0, len(directives))
 
+	// Directives that govern inline content the proxy may rewrite (URL replacement
+	// runs on the whole body including inline <script> and <style> blocks).
+	// Hash-based sources ('sha256-…', 'sha384-…', 'sha512-…') are invalidated when
+	// the content changes, so we strip those tokens and replace them with
+	// 'unsafe-inline' to keep scripts/styles functional.
+	contentDirectives := map[string]bool{
+		"default-src": true,
+		"script-src":  true,
+		"script-src-elem": true,
+		"style-src":   true,
+		"style-src-elem": true,
+	}
+
 	for _, dir := range directives {
 		trimmed := strings.TrimSpace(dir)
 		if trimmed == "" {
@@ -674,10 +687,38 @@ func rewriteCSP(csp, targetHost, rootDomain, proxyAddr string) string {
 			continue
 		}
 
-		rewritten := make([]string, len(tokens))
-		rewritten[0] = tokens[0] // directive name unchanged
-		for i, tok := range tokens[1:] {
-			rewritten[i+1] = rewriteCSPToken(tok, targetLower, rootLower, proxyAddr)
+		rewritten := make([]string, 0, len(tokens))
+		rewritten = append(rewritten, tokens[0]) // directive name unchanged
+		hadHash := false
+		for _, tok := range tokens[1:] {
+			lower := strings.ToLower(tok)
+			// Strip hash-based source tokens for content directives: 'sha256-…',
+			// 'sha384-…', 'sha512-…'. The proxy rewrites URL strings inside inline
+			// <script> and <style> blocks, invalidating the hash. We'll add
+			// 'unsafe-inline' below to keep the content functional.
+			if contentDirectives[name] &&
+				(strings.HasPrefix(lower, "'sha256-") ||
+					strings.HasPrefix(lower, "'sha384-") ||
+					strings.HasPrefix(lower, "'sha512-")) {
+				hadHash = true
+				continue
+			}
+			rewritten = append(rewritten, rewriteCSPToken(tok, targetLower, rootLower, proxyAddr))
+		}
+		// If we stripped hashes, inject 'unsafe-inline' so inline scripts/styles
+		// still load. Without it, the directive's source list may become overly
+		// restrictive (e.g. only 'nonce-…' sources) or even empty.
+		if hadHash {
+			alreadyUnsafe := false
+			for _, t := range rewritten[1:] {
+				if strings.ToLower(t) == "'unsafe-inline'" {
+					alreadyUnsafe = true
+					break
+				}
+			}
+			if !alreadyUnsafe {
+				rewritten = append(rewritten, "'unsafe-inline'")
+			}
 		}
 		out = append(out, strings.Join(rewritten, " "))
 	}

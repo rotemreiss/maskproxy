@@ -1295,7 +1295,9 @@ want: "img-src https://cdn.google.com",
 {
 name: "keywords preserved",
 in:   "script-src 'self' 'nonce-abc123' 'sha256-abc' 'unsafe-inline'",
-want: "script-src 'self' 'nonce-abc123' 'sha256-abc' 'unsafe-inline'",
+// 'sha256-abc' is stripped (content rewriting invalidates the hash);
+// 'unsafe-inline' already present so no duplicate is added.
+want: "script-src 'self' 'nonce-abc123' 'unsafe-inline'",
 },
 {
 name: "multiple directives all rewritten",
@@ -1332,6 +1334,36 @@ want: "connect-src ws://localhost:9001",
 name: "trailing semicolon produces no empty directive",
 in:   "default-src 'self'; script-src https://microsoft.com;",
 want: "default-src 'self'; script-src http://localhost:9001",
+},
+{
+name: "hash in script-src stripped and unsafe-inline added",
+in:   "script-src 'sha256-abc123=' https://microsoft.com",
+want: "script-src http://localhost:9001 'unsafe-inline'",
+},
+{
+name: "sha384 and sha512 also stripped",
+in:   "script-src 'sha256-abc=' 'sha384-xyz=' 'sha512-ZZZ='",
+want: "script-src 'unsafe-inline'",
+},
+{
+name: "hash in default-src stripped",
+in:   "default-src 'sha256-abc=' 'self'",
+want: "default-src 'self' 'unsafe-inline'",
+},
+{
+name: "hash in style-src stripped",
+in:   "style-src 'sha256-abc='",
+want: "style-src 'unsafe-inline'",
+},
+{
+name: "hash in non-content directive (img-src) preserved",
+in:   "img-src 'sha256-abc='",
+want: "img-src 'sha256-abc='",
+},
+{
+name: "hash stripped + unsafe-inline already present = no duplicate",
+in:   "script-src 'sha256-abc=' 'unsafe-inline'",
+want: "script-src 'unsafe-inline'",
 },
 }
 
