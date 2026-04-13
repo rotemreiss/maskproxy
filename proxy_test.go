@@ -886,7 +886,32 @@ func TestRewriteRootRelativePathsSrcset(t *testing.T) {
 	}
 }
 
-// TestRewriteRootRelativePathsCSS verifies that root-relative paths inside CSS
+// TestRewriteRootRelativePathsSrcsetMixed verifies srcset entries without
+// descriptors (space < 0 branch) and entries that don't start with "/" (continue branch).
+func TestRewriteRootRelativePathsSrcsetMixed(t *testing.T) {
+	sub := "assets.microsoft.com"
+	pfx := "/__sd__/" + sub
+
+	// No descriptor: srcset="/img/logo.png" (space < 0 path)
+	in := `<img srcset="/img/logo.png" alt="logo">`
+	got := rewriteRootRelativePaths(in, sub)
+	want := `srcset="` + pfx + `/img/logo.png"`
+	if !strings.Contains(got, want) {
+		t.Errorf("no-descriptor srcset: expected %q in %q", want, got)
+	}
+
+	// Mixed: one absolute (skip), one root-relative (rewrite)
+	in2 := `<img srcset="https://cdn.example.com/logo.png 2x, /img/logo.png 1x">`
+	got2 := rewriteRootRelativePaths(in2, sub)
+	// The absolute entry should be left alone (continue branch fires)
+	if strings.Contains(got2, pfx+"/img/logo.png 1x") == false {
+		t.Errorf("mixed srcset: expected root-relative to be rewritten in %q", got2)
+	}
+	if strings.Contains(got2, pfx+"https://") {
+		t.Errorf("mixed srcset: absolute URL should not be rewritten, got %q", got2)
+	}
+}
+
 // url() expressions are prefixed with the /__sd__/ route.
 func TestRewriteRootRelativePathsCSS(t *testing.T) {
 	sub := "copilot.microsoft.com"
