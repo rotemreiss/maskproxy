@@ -1363,6 +1363,11 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// strings differ in length from the originals.
 		resp.ContentLength = int64(len(rewritten))
 		resp.Header.Set("Content-Length", strconv.FormatInt(int64(len(rewritten)), 10))
+		// Remove Transfer-Encoding: chunked — the body is now a known-length
+		// buffer.  RFC 7230 §3.3: if both Transfer-Encoding and Content-Length
+		// are present, Transfer-Encoding takes precedence, so we must delete it
+		// or browsers would try to parse our plain body as chunked frames.
+		resp.Header.Del("Transfer-Encoding")
 
 		logger.LogResponse(resp, rewritten, start, replaceCount)
 		return nil

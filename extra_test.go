@@ -1837,3 +1837,54 @@ if capturedLen != len(bigBody) {
 t.Errorf("oversized body truncated: upstream received %d bytes, expected %d", capturedLen, len(bigBody))
 }
 }
+
+// TestChunkedResponseBodyRewrite verifies that when an upstream sends a
+// chunked-encoded response (Transfer-Encoding: chunked, no Content-Length),
+// the proxy rewrites the body correctly and removes Transfer-Encoding so the
+// browser receives a clean Content-Length response — not a malformed one with
+// both headers where chunked would take precedence and corrupt the body.
+func TestChunkedResponseBodyRewrite(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Del("Content-Length")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("upstream ResponseWriter does not implement Flusher")
+			return
+		}
+		fmt.Fprint(w, "<p>Hello from ctf challenge!</p>")
+		flusher.Flush()
+		fmt.Fprint(w, "<p>More ctf content</p>")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("ctf:acme", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got, _ := io.ReadAll(resp.Body)
+	body := string(got)
+
+	// User replacement must have applied.
+	if strings.Contains(body, "ctf") {
+		t.Errorf("body still contains 'ctf': %s", body)
+	}
+	if !strings.Contains(body, "acme") {
+		t.Errorf("body missing 'acme': %s", body)
+	}
+	// Transfer-Encoding must be removed since body is now fixed-length.
+	if te := resp.Header.Get("Transfer-Encoding"); te != "" {
+		t.Errorf("Transfer-Encoding header still present: %q", te)
+	}
+	// Content-Length must now be set.
+	if cl := resp.Header.Get("Content-Length"); cl == "" {
+		t.Error("Content-Length header missing after rewrite")
+	}
+}
