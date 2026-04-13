@@ -1398,6 +1398,21 @@ name: "frame-ancestors upstream host rewritten to proxy",
 in:   "frame-ancestors https://microsoft.com",
 want: "frame-ancestors http://localhost:9001",
 },
+{
+name: "strict-dynamic stripped when hashes are stripped",
+in:   "script-src 'strict-dynamic' 'sha256-abc' 'nonce-xyz'",
+want: "script-src 'nonce-xyz' 'unsafe-inline'",
+},
+{
+name: "strict-dynamic stripped case-insensitive",
+in:   "script-src 'STRICT-DYNAMIC' 'sha384-def'",
+want: "script-src 'unsafe-inline'",
+},
+{
+name: "strict-dynamic preserved when no hashes stripped",
+in:   "script-src 'strict-dynamic' 'nonce-abc'",
+want: "script-src 'strict-dynamic' 'nonce-abc'",
+},
 }
 
 for _, tc := range cases {

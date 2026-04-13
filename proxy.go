@@ -716,7 +716,21 @@ func rewriteCSP(csp, targetHost, rootDomain, proxyAddr string) string {
 		// If we stripped hashes, inject 'unsafe-inline' so inline scripts/styles
 		// still load. Without it, the directive's source list may become overly
 		// restrictive (e.g. only 'nonce-…' sources) or even empty.
+		//
+		// Also strip 'strict-dynamic' when we've stripped hashes: CSP Level 3
+		// browsers ignore 'unsafe-inline' (and host allowlists) when
+		// 'strict-dynamic' is present, so our injected 'unsafe-inline' would be
+		// silently ignored and inline content would remain blocked.
 		if hadHash {
+			filtered := rewritten[:1] // keep directive name
+			for _, t := range rewritten[1:] {
+				if strings.ToLower(t) == "'strict-dynamic'" {
+					continue
+				}
+				filtered = append(filtered, t)
+			}
+			rewritten = filtered
+
 			alreadyUnsafe := false
 			for _, t := range rewritten[1:] {
 				if strings.ToLower(t) == "'unsafe-inline'" {
