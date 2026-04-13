@@ -685,10 +685,14 @@ func TestSSRFBlockedViaSdPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	// The proxy should not have forwarded to the ssrfTarget (tested via t.Errorf above),
-	// and should return some non-5xx response (it re-routes to the main target).
-	if resp.StatusCode == 0 {
-		t.Errorf("expected a response, got status 0")
+	// Proxy must return 403 Forbidden and never forward to the ssrfTarget
+	// (tested via t.Errorf in the ssrfTarget handler above).
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for SSRF attempt, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), ssrfHost) {
+		t.Errorf("403 body should contain the blocked host %q; got %q", ssrfHost, string(body))
 	}
 }
 

@@ -42,6 +42,12 @@ var hopByHopHeaders = map[string]bool{
 // with other context values.
 type clientHostContextKey struct{}
 
+// ssrfBlockedKey is set on the request context by the director when a
+// /__sd__/<host> request targets a host outside the proxy's allowed domain.
+// The ssrfGuardTransport detects this and returns a 403 response directly,
+// never making an upstream connection.
+type ssrfBlockedKey struct{}
+
 // absURLRe matches absolute and protocol-relative URLs (used to protect
 // external links from being corrupted by user-defined string replacements).
 var absURLRe = regexp.MustCompile(`(?:https?:)?//[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,}[^\s"'<>\x00-\x1F]*`)
@@ -625,8 +631,34 @@ func unmaskRequestString(s, targetHost, scheme, proxyAddr string) string {
 	return s
 }
 
-// ── WebSocket frame logging ───────────────────────────────────────────────────
-//
+// ── SSRF guard transport ──────────────────────────────────────────────────────
+
+// ssrfGuardTransport wraps an http.RoundTripper and short-circuits requests
+// that the director flagged as SSRF attempts (via ssrfBlockedKey context).
+// Returning a synthetic 403 response means no upstream connection is made and
+// the client gets a clear, actionable error instead of a silently wrong page.
+type ssrfGuardTransport struct {
+	rt http.RoundTripper
+}
+
+func (t *ssrfGuardTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if blockedHost, ok := req.Context().Value(ssrfBlockedKey{}).(string); ok {
+		body := "403 Forbidden: /__sd__/" + blockedHost + " is not under the proxy's target domain\n"
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Status:     "403 Forbidden",
+			Proto:      "HTTP/1.1",
+			ProtoMajor: 1,
+			ProtoMinor: 1,
+			Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	}
+	return t.rt.RoundTrip(req)
+}
+
+
 // After a 101 Switching Protocols upgrade, httputil.ReverseProxy calls
 // Hijack() on both connections and copies raw bytes bidirectionally — no
 // middleware hook exists.  To observe WS frames we wrap the backend
@@ -896,6 +928,9 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	if logger.logWS {
 		rt = &wsLoggingTransport{rt: transport, logger: logger}
 	}
+	// Always wrap with the SSRF guard so that /__sd__/ requests flagged by the
+	// director are short-circuited with a 403 before any upstream connection.
+	rt = &ssrfGuardTransport{rt: rt}
 
 	// reqTimes stores the start time recorded in the director so that
 	// modifyResponse can compute round-trip latency.  sync.Map is used because
@@ -974,11 +1009,12 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			validSubdomain := subHostLower == rootLower ||
 				strings.HasSuffix(subHostLower, "."+rootLower)
 			if !validSubdomain {
-				// Route to the main target and drop the /__sd__ prefix — this prevents
-				// SSRF while still serving a (possibly wrong) response rather than a
-				// hard 400 that could break page loads if a stale URL slips through.
+				// Flag request as SSRF-blocked in the context.
+				// ssrfGuardTransport intercepts this and returns a 403 directly,
+				// so no upstream connection is made for the malicious host.
 				logger.Printf("maskproxy: blocked SSRF attempt via /__sd__/%s (not under %s)", subHost, rootDomain)
-				req.URL.Path = subPath
+				*req = *req.WithContext(context.WithValue(req.Context(), ssrfBlockedKey{}, subHost))
+				req.URL.Path = "/"
 				req.URL.RawPath = ""
 			} else {
 				req.URL.Host = subHost
