@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -1094,23 +1095,40 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		}
 
 		// Same two-pass rewrite for the request body (e.g. form POST, JSON).
-		// Also skipped for ignored hosts.
+		// Also skipped for ignored hosts and non-text content types.
 		if req.Body != nil {
-			body, err := io.ReadAll(req.Body)
-			req.Body.Close()
+			// Gate on Content-Type to avoid corrupting binary uploads (images,
+			// multipart file uploads, protobuf, etc.).
+			reqCT := req.Header.Get("Content-Type")
+			bodyIsText := reqCT == "" || isTextContent(reqCT)
+
+			// Read up to maxBodyRewrite+1 bytes to detect oversized bodies.
+			// Do NOT close req.Body yet — the tail of the stream may still be there.
+			raw, err := io.ReadAll(io.LimitReader(req.Body, maxBodyRewrite+1))
 			if err == nil {
-				rewritten := string(body)
-				replaceCount := 0
-				if !ignored.contains(outboundHost) {
-					if rep.HasPairs() {
-						rewritten, replaceCount = rep.ToOriginalDiff(rewritten)
+				if int64(len(raw)) > maxBodyRewrite || !bodyIsText {
+					// Body too large or binary: stitch already-read prefix back with
+					// the remaining stream (like the response path does) so no bytes
+					// are lost.  ContentLength stays at the original value so the
+					// upstream receives the correct Transfer-Encoding.
+					req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(raw), req.Body))
+					start := logger.LogRequest(req, "", false, 0)
+					reqTimes.Store(req, start)
+				} else {
+					req.Body.Close()
+					rewritten := string(raw)
+					replaceCount := 0
+					if !ignored.contains(outboundHost) {
+						if rep.HasPairs() {
+							rewritten, replaceCount = rep.ToOriginalDiff(rewritten)
+						}
+						rewritten = unmaskRequestString(rewritten, outboundHost, scheme, proxyAddr)
 					}
-					rewritten = unmaskRequestString(rewritten, outboundHost, scheme, proxyAddr)
+					req.Body = io.NopCloser(strings.NewReader(rewritten))
+					req.ContentLength = int64(len(rewritten))
+					start := logger.LogRequest(req, rewritten, false, replaceCount)
+					reqTimes.Store(req, start)
 				}
-				req.Body = io.NopCloser(strings.NewReader(rewritten))
-				req.ContentLength = int64(len(rewritten))
-				start := logger.LogRequest(req, rewritten, false, replaceCount)
-				reqTimes.Store(req, start)
 			}
 		} else {
 			// Bodyless request (GET, HEAD, etc.) — still log + record start time.

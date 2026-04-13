@@ -17,6 +17,7 @@ package main
 //     effectiveProxyAddr (127.0.0.1 → 127.0.0.1 in Location, not localhost)
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -1766,4 +1767,73 @@ func TestSVGBodyRewrite(t *testing.T) {
 	if !strings.Contains(body, "Plain acme text") {
 		t.Errorf("SVG text missing 'Plain acme text':\n%s", body)
 	}
+}
+
+// TestRequestBodyBinarySkip verifies that binary request bodies (e.g. image
+// uploads) are forwarded to the upstream unchanged, even when replacement pairs
+// are configured — corrupting binary data would break file uploads entirely.
+func TestRequestBodyBinarySkip(t *testing.T) {
+var capturedBody []byte
+
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+capturedBody, _ = io.ReadAll(r.Body)
+w.Header().Set("Content-Type", "text/plain")
+fmt.Fprint(w, "ok")
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("ctf:acme", false)
+proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+// Construct a fake binary payload that contains "ctf" — it must NOT be replaced.
+binaryPayload := []byte{0xFF, 0xD8, 0xFF, 'c', 't', 'f', 0x00, 0x42}
+req, _ := http.NewRequest("POST", ps.URL+"/upload", bytes.NewReader(binaryPayload))
+req.Header.Set("Content-Type", "image/jpeg")
+resp, err := ps.Client().Do(req)
+if err != nil {
+t.Fatal(err)
+}
+resp.Body.Close()
+
+if !bytes.Equal(capturedBody, binaryPayload) {
+t.Errorf("binary request body was modified: got %v, want %v", capturedBody, binaryPayload)
+}
+}
+
+// TestRequestBodySizeLimit verifies that a request body larger than maxBodyRewrite
+// is forwarded intact (not truncated) and does not panic or OOM.
+func TestRequestBodySizeLimit(t *testing.T) {
+var capturedLen int
+
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+b, _ := io.ReadAll(r.Body)
+capturedLen = len(b)
+w.Header().Set("Content-Type", "text/plain")
+fmt.Fprint(w, "ok")
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("ctf:acme", false)
+proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+// Build a body that exceeds maxBodyRewrite (51 MiB of text that contains "ctf").
+const overLimit = maxBodyRewrite + 1024
+bigBody := strings.Repeat("ctf.", overLimit/4)
+req, _ := http.NewRequest("POST", ps.URL+"/big", strings.NewReader(bigBody))
+req.Header.Set("Content-Type", "text/plain")
+resp, err := ps.Client().Do(req)
+if err != nil {
+t.Fatal(err)
+}
+resp.Body.Close()
+
+if capturedLen != len(bigBody) {
+t.Errorf("oversized body truncated: upstream received %d bytes, expected %d", capturedLen, len(bigBody))
+}
 }
