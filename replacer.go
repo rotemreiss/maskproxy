@@ -124,62 +124,40 @@ func buildRegexp(pairs []Pair, field string, caseInsensitive bool) *regexp.Regex
 	return regexp.MustCompile(prefix + "(?:" + strings.Join(parts, "|") + ")")
 }
 
-// replaceCI replaces all case-insensitive occurrences of old with new in s.
-func replaceCI(s, old, newVal string) string {
-	re := regexp.MustCompile(`(?i)` + regexp.QuoteMeta(old))
-	return re.ReplaceAllString(s, newVal)
-}
-
 // ToOriginal rewrites s by replacing every Alias with its Original.
 // Used when rewriting outbound requests (client aliases → server originals).
 func (r *Replacer) ToOriginal(s string) string {
-	if r.reReq != nil {
-		return r.reReq.ReplaceAllStringFunc(s, func(m string) string {
-			key := m
-			if r.caseInsensitive {
-				key = strings.ToLower(key)
-			}
-			if v, ok := r.lookupReq[key]; ok {
-				return v
-			}
-			return m
-		})
+	if r.reReq == nil {
+		return s // no pairs configured
 	}
-	// Fallback for empty pairs (should not occur, but be safe).
-	for _, p := range r.forRequest {
+	return r.reReq.ReplaceAllStringFunc(s, func(m string) string {
+		key := m
 		if r.caseInsensitive {
-			s = replaceCI(s, p.Alias, p.Original)
-		} else {
-			s = strings.ReplaceAll(s, p.Alias, p.Original)
+			key = strings.ToLower(key)
 		}
-	}
-	return s
+		if v, ok := r.lookupReq[key]; ok {
+			return v
+		}
+		return m
+	})
 }
 
 // ToAlias rewrites s by replacing every Original with its Alias.
 // Used when rewriting inbound responses (server originals → client aliases).
 func (r *Replacer) ToAlias(s string) string {
-	if r.reResp != nil {
-		return r.reResp.ReplaceAllStringFunc(s, func(m string) string {
-			key := m
-			if r.caseInsensitive {
-				key = strings.ToLower(key)
-			}
-			if v, ok := r.lookupResp[key]; ok {
-				return v
-			}
-			return m
-		})
+	if r.reResp == nil {
+		return s // no pairs configured
 	}
-	// Fallback for empty pairs.
-	for _, p := range r.forResponse {
+	return r.reResp.ReplaceAllStringFunc(s, func(m string) string {
+		key := m
 		if r.caseInsensitive {
-			s = replaceCI(s, p.Original, p.Alias)
-		} else {
-			s = strings.ReplaceAll(s, p.Original, p.Alias)
+			key = strings.ToLower(key)
 		}
-	}
-	return s
+		if v, ok := r.lookupResp[key]; ok {
+			return v
+		}
+		return m
+	})
 }
 
 // HasPairs reports whether any replacement pairs were configured.
@@ -190,84 +168,39 @@ func (r *Replacer) HasPairs() bool {
 // ToOriginalDiff is like ToOriginal but also returns the number of substitutions made.
 func (r *Replacer) ToOriginalDiff(s string) (string, int) {
 	count := 0
-	if r.reReq != nil {
-		result := r.reReq.ReplaceAllStringFunc(s, func(m string) string {
-			key := m
-			if r.caseInsensitive {
-				key = strings.ToLower(key)
-			}
-			if v, ok := r.lookupReq[key]; ok {
-				count++
-				return v
-			}
-			return m
-		})
-		return result, count
+	if r.reReq == nil {
+		return s, 0 // no pairs configured
 	}
-	result := s
-	for _, p := range r.forRequest {
-		var rewritten string
+	result := r.reReq.ReplaceAllStringFunc(s, func(m string) string {
+		key := m
 		if r.caseInsensitive {
-			rewritten = replaceCI(result, p.Alias, p.Original)
-		} else {
-			rewritten = strings.ReplaceAll(result, p.Alias, p.Original)
+			key = strings.ToLower(key)
 		}
-		// Count occurrences by measuring length difference against alias/original lengths.
-		if len(p.Alias) > 0 {
-			count += (len(result) - len(rewritten) + len(p.Original)*countOccurrences(result, p.Alias, r.caseInsensitive)) / max(len(p.Alias), 1)
+		if v, ok := r.lookupReq[key]; ok {
+			count++
+			return v
 		}
-		result = rewritten
-	}
+		return m
+	})
 	return result, count
 }
 
 // ToAliasDiff is like ToAlias but also returns the number of substitutions made.
 func (r *Replacer) ToAliasDiff(s string) (string, int) {
 	count := 0
-	if r.reResp != nil {
-		result := r.reResp.ReplaceAllStringFunc(s, func(m string) string {
-			key := m
-			if r.caseInsensitive {
-				key = strings.ToLower(key)
-			}
-			if v, ok := r.lookupResp[key]; ok {
-				count++
-				return v
-			}
-			return m
-		})
-		return result, count
+	if r.reResp == nil {
+		return s, 0 // no pairs configured
 	}
-	result := s
-	for _, p := range r.forResponse {
-		var rewritten string
+	result := r.reResp.ReplaceAllStringFunc(s, func(m string) string {
+		key := m
 		if r.caseInsensitive {
-			rewritten = replaceCI(result, p.Original, p.Alias)
-		} else {
-			rewritten = strings.ReplaceAll(result, p.Original, p.Alias)
+			key = strings.ToLower(key)
 		}
-		result = rewritten
-	}
+		if v, ok := r.lookupResp[key]; ok {
+			count++
+			return v
+		}
+		return m
+	})
 	return result, count
-}
-
-// countOccurrences returns the number of times sub appears in s.
-// When ci is true the comparison is case-insensitive.
-func countOccurrences(s, sub string, ci bool) int {
-	if sub == "" {
-		return 0
-	}
-	if ci {
-		s = strings.ToLower(s)
-		sub = strings.ToLower(sub)
-	}
-	return strings.Count(s, sub)
-}
-
-// max returns the larger of a and b (for Go <1.21 compatibility).
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

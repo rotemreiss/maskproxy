@@ -124,6 +124,89 @@ func TestLoadReplaceFileInvalidLine(t *testing.T) {
 	}
 }
 
+// TestCaseInsensitiveReplacer verifies that the default (case-insensitive) mode
+// matches upper, lower, and mixed-case occurrences while preserving the exact
+// replacement string (not the matched casing).
+func TestCaseInsensitiveReplacer(t *testing.T) {
+	// caseInsensitive = true (production default — -cs flag not set)
+	rep, err := NewReplacer("ctf:acme,ctfd:foo", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"ctf", "acme"},
+		{"CTF", "acme"},
+		{"Ctf", "acme"},
+		{"ctfd", "foo"},
+		{"CTFD", "foo"},
+		// Longer match wins over shorter (ctfd before ctf).
+		{"CTFd login CTF", "foo login acme"},
+		// Mixed sentence.
+		{"Welcome to CTFd, the ctf platform", "Welcome to foo, the acme platform"},
+	}
+	for _, tc := range tests {
+		got := rep.ToAlias(tc.input)
+		if got != tc.want {
+			t.Errorf("ToAlias(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+
+	// ToOriginal (alias → original): acme → ctf, foo → ctfd
+	origTests := []struct {
+		input string
+		want  string
+	}{
+		{"ACME", "ctf"},
+		{"acme", "ctf"},
+		{"FOO", "ctfd"},
+		{"foo", "ctfd"},
+		{"Acme login Foo", "ctf login ctfd"},
+	}
+	for _, tc := range origTests {
+		got := rep.ToOriginal(tc.input)
+		if got != tc.want {
+			t.Errorf("ToOriginal(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+// TestCaseSensitiveReplacer verifies that -cs mode does NOT match different cases.
+func TestCaseSensitiveReplacer(t *testing.T) {
+	// caseInsensitive = false (passes -cs flag)
+	rep, err := NewReplacer("ctf:acme", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Exact case matches.
+	if got := rep.ToAlias("ctf"); got != "acme" {
+		t.Errorf("ToAlias(exact): got %q want %q", got, "acme")
+	}
+	// Different case must NOT match.
+	if got := rep.ToAlias("CTF"); got != "CTF" {
+		t.Errorf("ToAlias(upper case): got %q, expected no replacement", got)
+	}
+}
+
+// TestCaseInsensitiveDiff verifies ToAliasDiff counts replacements correctly in CI mode.
+func TestCaseInsensitiveDiff(t *testing.T) {
+	rep, err := NewReplacer("ctf:acme", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, count := rep.ToAliasDiff("CTF ctf Ctf")
+	if count != 3 {
+		t.Errorf("expected 3 replacements, got %d", count)
+	}
+	if result != "acme acme acme" {
+		t.Errorf("unexpected result: %q", result)
+	}
+}
+
 // BenchmarkReplacerToAlias measures the hot-path cost of response body replacement.
 // Run with: go test -bench=BenchmarkReplacer -benchtime=5s
 func BenchmarkReplacerToAlias(b *testing.B) {
