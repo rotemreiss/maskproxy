@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ─── isTextContent ───────────────────────────────────────────────────────────
@@ -2228,4 +2229,66 @@ t.Errorf("Content-Encoding = %q; want %q", ce, "deflate")
 if !bytes.Equal(body, compressedBytes) {
 t.Errorf("body was not restored: got %d bytes, want %d bytes (original compressed)", len(body), len(compressedBytes))
 }
+}
+
+// TestSSEPassthrough verifies that text/event-stream responses are not buffered:
+// the proxy must pass the streaming body through without calling io.ReadAll.
+func TestSSEPassthrough(t *testing.T) {
+// Use a pipe so we control when the stream ends.
+pr, pw := io.Pipe()
+defer pw.Close()
+
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+w.Header().Set("Content-Type", "text/event-stream")
+w.Header().Set("Cache-Control", "no-cache")
+w.WriteHeader(http.StatusOK)
+// Write one event and flush — client should see it without waiting for stream close.
+fmt.Fprint(w, "data: hello ctf world\n\n")
+if f, ok := w.(http.Flusher); ok {
+f.Flush()
+}
+// Block until the test's pipe reader signals done.
+io.Copy(io.Discard, pr)
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("ctf:acme", false)
+proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil, 0)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+resp, err := http.Get(ps.URL + "/events")
+if err != nil {
+t.Fatal(err)
+}
+defer resp.Body.Close()
+
+// We must be able to read the first event immediately (no full-stream buffering).
+buf := make([]byte, 256)
+done := make(chan error, 1)
+go func() {
+n, err := resp.Body.Read(buf)
+if err != nil && err != io.EOF {
+done <- err
+return
+}
+got := string(buf[:n])
+if !strings.Contains(got, "data: hello ctf world") {
+done <- fmt.Errorf("expected SSE event, got: %q", got)
+return
+}
+done <- nil
+}()
+
+select {
+case err := <-done:
+if err != nil {
+t.Fatal(err)
+}
+case <-time.After(3 * time.Second):
+t.Fatal("SSE response timed out — proxy is buffering the entire stream")
+}
+// Close the pipe to let the upstream handler finish.
+pw.Close()
 }

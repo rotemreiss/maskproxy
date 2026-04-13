@@ -1407,7 +1407,19 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			return nil
 		}
 
-		// Decompress gzip or deflate before string replacement.
+		// Server-Sent Events (text/event-stream) are long-lived streaming
+		// responses that must not be fully buffered — io.ReadAll would block
+		// until the stream closes.  FlushInterval=-1 on the ReverseProxy
+		// handles progressive flushing; we skip body rewriting here so the
+		// client receives each "data: …\n\n" event in real time.
+		// Header rewriting above already ran, so host masking in headers is
+		// still applied even for SSE responses.
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0])), "text/event-stream") {
+			logger.LogResponse(resp, "", start, 0)
+			return nil
+		}
+
+
 		// We advertise Accept-Encoding: gzip, deflate, identity. Anything else
 		// (br, zstd) is forwarded unchanged to avoid corrupting compressed bytes.
 		var bodyReader io.Reader = resp.Body
