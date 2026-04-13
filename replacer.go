@@ -37,8 +37,9 @@ type Replacer struct {
 
 // NewReplacer parses the -replace flag value (e.g. "ctf:acme,ctfd:foo").
 // Format: a comma-separated list of "original:alias" pairs.
-// When caseInsensitive is true, both ToOriginal and ToAlias match regardless
-// of the case of the source string (the replacement value is used as-is).
+// caseInsensitive controls matching behaviour: when true (the default when
+// invoked from main), ToOriginal and ToAlias match regardless of case.
+// Pass false (via -cs flag) to restrict matching to the exact case specified.
 func NewReplacer(spec string, caseInsensitive bool) (*Replacer, error) {
 	r := &Replacer{caseInsensitive: caseInsensitive}
 	if spec == "" {

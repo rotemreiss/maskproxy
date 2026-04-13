@@ -74,6 +74,44 @@ func TestReplacerInvalidPair(t *testing.T) {
 	}
 }
 
+// TestReplacerCaseInsensitiveDefault verifies that caseInsensitive=true (the
+// default when the proxy is invoked without -cs) matches mixed-case strings.
+func TestReplacerCaseInsensitiveDefault(t *testing.T) {
+	// caseInsensitive=true mirrors the production default (!*cs where cs=false).
+	r, _ := NewReplacer("microsoft:msctf", true)
+
+	tests := []struct{ input, want string }{
+		{"Microsoft", "msctf"},
+		{"MICROSOFT", "msctf"},
+		{"microsoft", "msctf"},
+		{"MiCrOsOfT", "msctf"},
+	}
+	for _, tc := range tests {
+		got := r.ToAlias(tc.input)
+		if got != tc.want {
+			t.Errorf("CI ToAlias(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+// TestReplacerCaseSensitiveFlag verifies that caseInsensitive=false (the
+// behaviour when -cs is passed) only matches exact case.
+func TestReplacerCaseSensitiveFlag(t *testing.T) {
+	// caseInsensitive=false mirrors -cs behaviour.
+	r, _ := NewReplacer("microsoft:msctf", false)
+
+	if got := r.ToAlias("microsoft"); got != "msctf" {
+		t.Errorf("CS exact match: got %q want %q", got, "msctf")
+	}
+	// Mixed-case should NOT be rewritten when case-sensitive.
+	if got := r.ToAlias("Microsoft"); got != "Microsoft" {
+		t.Errorf("CS should not rewrite mixed-case: got %q want %q", got, "Microsoft")
+	}
+	if got := r.ToAlias("MICROSOFT"); got != "MICROSOFT" {
+		t.Errorf("CS should not rewrite upper-case: got %q want %q", got, "MICROSOFT")
+	}
+}
+
 // ---- Integration tests via httptest ----
 
 // newUpstream returns a test server that echoes back the request URL path and

@@ -36,8 +36,10 @@ Options:
                            Default is HTTPS.
   -skip-verify             Skip TLS certificate verification for the upstream.
                            Use this when the target has a self-signed certificate.
-  -ci                      Case-insensitive string replacement.
-                           Matches "Microsoft", "MICROSOFT", "microsoft", etc.
+  -cs                      Case-sensitive string replacement.
+                           By default replacements are case-insensitive and match
+                           "Microsoft", "MICROSOFT", "microsoft", etc.
+                           Use -cs to match only the exact case you specify.
   -exact-domain            Only mask the exact target host.
                            By default maskproxy also masks every subdomain of the
                            target's root domain (api.*, cdn.*, auth.*, …) so
@@ -104,7 +106,7 @@ func main() {
 	replaceFile := flag.String("replace-file", "", "File with one original:alias pair per line (# comments ok)")
 	insecure := flag.Bool("insecure", false, "Use plain HTTP for the upstream (no TLS)")
 	skipVerify := flag.Bool("skip-verify", false, "Skip TLS certificate verification (for self-signed certs)")
-	ci := flag.Bool("ci", false, "Case-insensitive string replacement (e.g. matches 'Microsoft' and 'MICROSOFT')")
+	cs := flag.Bool("cs", false, "Case-sensitive string replacement (default is case-insensitive)")
 	exactDomain := flag.Bool("exact-domain", false, "Only mask the exact target host, not subdomains")
 	timeout := flag.Duration("timeout", 30*time.Second, "Upstream dial/TLS/response-header timeout (0 = no timeout)")
 	verbose := flag.Bool("verbose", false, "Log full request/response headers and body preview")
@@ -153,7 +155,7 @@ func main() {
 		}
 	}
 
-	rep, err := NewReplacer(combinedSpec, *ci)
+	rep, err := NewReplacer(combinedSpec, !*cs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: invalid replacement pairs: %v\n", err)
 		os.Exit(1)
@@ -187,6 +189,9 @@ func main() {
 	logger.Printf("  → upstream: %s://%s", scheme, *target)
 	if rep.HasPairs() {
 		logger.Printf("  → replacements: %s", combinedSpec)
+		if *cs {
+			logger.Printf("  → replacement mode: case-sensitive (-cs)")
+		}
 	}
 	if len(extraHeaders) > 0 {
 		for _, h := range extraHeaders {
