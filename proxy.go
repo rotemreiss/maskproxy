@@ -913,6 +913,16 @@ func rewriteCSP(csp, targetHost, rootDomain, proxyAddr string) string {
 			continue
 		}
 
+		// Drop require-sri-for.  This directive requires SRI on all scripts and
+		// styles.  The proxy strips SRI integrity attributes from HTML elements
+		// (sriIntegrityRe) because rewriting changes the hash.  But if require-sri-for
+		// is still present, the browser will block all resources that lack integrity
+		// attributes — exactly the ones we just stripped.  Remove this directive so
+		// resources can load without SRI enforcement.
+		if name == "require-sri-for" {
+			continue
+		}
+
 		rewritten := make([]string, 0, len(tokens))
 		rewritten = append(rewritten, tokens[0]) // directive name unchanged
 		hadHash := false
