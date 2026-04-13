@@ -1365,6 +1365,21 @@ name: "hash stripped + unsafe-inline already present = no duplicate",
 in:   "script-src 'sha256-abc=' 'unsafe-inline'",
 want: "script-src 'unsafe-inline'",
 },
+{
+name: "frame-ancestors none dropped (consistent with X-Frame-Options stripping)",
+in:   "default-src 'self'; frame-ancestors 'none'",
+want: "default-src 'self'",
+},
+{
+name: "frame-ancestors self preserved (allows proxy origin to frame)",
+in:   "default-src 'self'; frame-ancestors 'self'",
+want: "default-src 'self'; frame-ancestors 'self'",
+},
+{
+name: "frame-ancestors upstream host rewritten to proxy",
+in:   "frame-ancestors https://microsoft.com",
+want: "frame-ancestors http://localhost:9001",
+},
 }
 
 for _, tc := range cases {

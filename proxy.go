@@ -686,6 +686,14 @@ func rewriteCSP(csp, targetHost, rootDomain, proxyAddr string) string {
 		if name == "report-uri" || name == "report-to" {
 			continue
 		}
+		// Drop frame-ancestors 'none': this directive prevents any framing of the
+		// page, including by the proxy itself.  We already strip X-Frame-Options
+		// for the same reason.  'frame-ancestors *' or 'frame-ancestors http://…'
+		// are handled by rewriteCSPToken (upstream origins rewritten to proxy addr).
+		if name == "frame-ancestors" && len(tokens) == 2 &&
+			strings.ToLower(tokens[1]) == "'none'" {
+			continue
+		}
 
 		rewritten := make([]string, 0, len(tokens))
 		rewritten = append(rewritten, tokens[0]) // directive name unchanged
