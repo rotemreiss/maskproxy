@@ -2811,3 +2811,43 @@ func TestXFrameOptionsStripped(t *testing.T) {
 		t.Errorf("X-Frame-Options not stripped: %q", v)
 	}
 }
+
+// TestSecFetchAndUpgradeInsecureStripped verifies that Sec-Fetch-* and
+// Upgrade-Insecure-Requests headers are stripped from outbound requests.
+// These describe the browser's security context relative to the proxy
+// origin (localhost:PORT), not the upstream, and can mislead upstream CORS
+// or security logic.
+func TestSecFetchAndUpgradeInsecureStripped(t *testing.T) {
+	var sawHeaders http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	req, _ := http.NewRequest("GET", ps.URL+"/", nil)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	for _, hdr := range []string{"Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Sec-Fetch-User", "Upgrade-Insecure-Requests"} {
+		if v := sawHeaders.Get(hdr); v != "" {
+			t.Errorf("%s forwarded to upstream: %q", hdr, v)
+		}
+	}
+}

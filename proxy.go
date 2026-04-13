@@ -1411,6 +1411,22 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// Strip Via to avoid leaking proxy metadata to the upstream server.
 		req.Header.Del("Via")
 
+		// Strip Sec-Fetch-* headers.  These describe the browser's security
+		// context relative to the proxy origin (localhost:PORT), not the upstream.
+		// For example, Sec-Fetch-Site: same-origin is accurate from the browser's
+		// perspective (both pages are at localhost:PORT), but misleading to the
+		// upstream which sees its own origin.  Removing them lets upstream apply
+		// its normal CORS and Fetch-Metadata policies without confusion.
+		req.Header.Del("Sec-Fetch-Site")
+		req.Header.Del("Sec-Fetch-Mode")
+		req.Header.Del("Sec-Fetch-Dest")
+		req.Header.Del("Sec-Fetch-User")
+
+		// Strip Upgrade-Insecure-Requests.  This header asks upstream to redirect
+		// HTTP requests to HTTPS.  When the proxy is talking HTTP to upstream (non-
+		// SSL mode) forwarding it can cause an unnecessary 301 redirect loop.
+		req.Header.Del("Upgrade-Insecure-Requests")
+
 		// Strip conditional-request headers sent by the browser so the upstream
 		// always returns the full response body.  If we forwarded these and got
 		// a 304 Not Modified, ModifyResponse would skip body rewriting (noBody
