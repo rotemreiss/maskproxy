@@ -92,6 +92,18 @@ var metaRefreshRe = regexp.MustCompile(`(?i)(content\s*=\s*["'][0-9]+\s*;\s*url=
 // Group 1 = the root-relative path (the part between < and >).
 var linkHeaderRe = regexp.MustCompile(`<(/[^/][^>]*)>`)
 
+// sriIntegrityRe matches Subresource Integrity `integrity` attributes on
+// HTML elements.  When the proxy rewrites script or stylesheet content via
+// string replacement, the cryptographic hash encoded in the attribute no
+// longer matches the (now-modified) bytes, causing the browser to block the
+// resource.  We strip the attribute so the browser skips the SRI check.
+//
+// The same logic applies to the paired `crossorigin` attribute when it is
+// present solely to enable the CORS fetch needed for SRI checking — but we
+// leave `crossorigin` in place because it can also control how credentials
+// are sent and stripping it might break requests unnecessarily.
+var sriIntegrityRe = regexp.MustCompile(`(?i)\s+integrity\s*=\s*(?:"[^"]*"|'[^']*')`)
+
 // maxBodyRewriteDefault is the default maximum body size for rewriting.
 const maxBodyRewriteDefault = int64(50 * 1024 * 1024) // 50 MiB
 
@@ -1602,6 +1614,18 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// /__sd__/ route rather than the proxy root.
 		if reqHost := resp.Request.URL.Host; !strings.EqualFold(reqHost, targetHost) && reqHost != "" {
 			rewritten = rewriteRootRelativePaths(rewritten, reqHost)
+		}
+
+		// Pass 2b: strip SRI integrity attributes from HTML.
+		// When string replacements are active, modified script/stylesheet bytes
+		// will no longer match the integrity hash, causing the browser to block
+		// the resource.  Stripping the attribute lets the browser load the
+		// (possibly rewritten) content without the SRI check.
+		// We strip unconditionally for HTML responses: even URL-only rewrites in
+		// the HTML page itself change the document bytes, and any proxied asset
+		// might have been rewritten if the replacer has active pairs.
+		if strings.HasPrefix(contentType, "text/html") {
+			rewritten = sriIntegrityRe.ReplaceAllString(rewritten, "")
 		}
 
 		var replaceCount int

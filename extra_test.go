@@ -2444,3 +2444,45 @@ if ce := resp.Header.Get("Content-Encoding"); ce != "" {
 t.Errorf("Content-Encoding not stripped: %q", ce)
 }
 }
+
+// TestSRIIntegrityStripped verifies that integrity attributes are removed from
+// HTML responses so that Subresource Integrity checks don't block resources
+// whose bytes have been modified by the proxy's string replacement.
+func TestSRIIntegrityStripped(t *testing.T) {
+	htmlBody := "<html><head>" +
+		`<script src="/app.js" integrity="sha256-abc123" crossorigin="anonymous"></script>` +
+		`<link rel="stylesheet" href="/style.css" integrity="sha384-xyz789">` +
+		"<script src=\"/other.js\"></script>" +
+		"</head></html>"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, htmlBody)
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("ctf:acme", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp2, err := http.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	got, _ := io.ReadAll(resp2.Body)
+	s := string(got)
+
+	if strings.Contains(s, "integrity=") {
+		t.Errorf("integrity attribute not stripped from HTML: %s", s)
+	}
+	// crossorigin and src should remain untouched.
+	if !strings.Contains(s, `crossorigin="anonymous"`) {
+		t.Errorf("crossorigin attribute unexpectedly removed: %s", s)
+	}
+	if !strings.Contains(s, `src="/app.js"`) {
+		t.Errorf("src attribute unexpectedly removed: %s", s)
+	}
+}
