@@ -520,6 +520,15 @@ func buildTestSubdomainRe(targetHost string) *regexp.Regexp {
 	)
 }
 
+// buildTestBareTargetRe compiles the bare-targetHost regex the same way NewReverseProxy does.
+func buildTestBareTargetRe(targetHost string) *regexp.Regexp {
+	return regexp.MustCompile(
+		`(?i)(^|[^-a-zA-Z0-9.])` +
+			regexp.QuoteMeta(targetHost) +
+			`([^-a-zA-Z0-9.]|$)`,
+	)
+}
+
 func TestMaskResponseStringSubdomains(t *testing.T) {
 	target := "www.example.com"
 	proxy := "localhost:8081"
@@ -543,10 +552,17 @@ func TestMaskResponseStringSubdomains(t *testing.T) {
 		{"https://cdn.other.net/img.png", "https://cdn.other.net/img.png"},
 		// Boundary guard — evil.com suffix must NOT be consumed.
 		{"https://sub.example.com.evil.com/path", "https://sub.example.com.evil.com/path"},
+		// Domain-boundary guard on step 4 (bare targetHost scan):
+		// "target.www.example.com" in plain text (dot-separated) — the preceding dot
+		// means bareTargetRe won't corrupt it.
+		{`target.www.example.com/rest/v1`, `target.www.example.com/rest/v1`},
+		// Bare targetHost in non-URL context should still be replaced.
+		{`Domain=www.example.com; Path=/`, `Domain=localhost:8081; Path=/`},
+		{`visit www.example.com today`, `visit localhost:8081 today`},
 	}
 
 	for _, c := range cases {
-		got := maskResponseString(c.in, target, computeRootDomain(target), proxy, re)
+		got := maskResponseString(c.in, target, computeRootDomain(target), proxy, re, buildTestBareTargetRe(target))
 		if got != c.want {
 			t.Errorf("maskResponseString(%q)\n  got  %q\n  want %q", c.in, got, c.want)
 		}
@@ -570,14 +586,13 @@ func TestMaskResponseString2LabelTarget(t *testing.T) {
 		{"https://gist.github.com/", "http://localhost:8081/__sd__/gist.github.com/"},
 		// Bare target is handled by literal replacements (no prefix).
 		{"https://github.com/explore", "http://localhost:8081/explore"},
-		// Note: "github.com" inside a third-party hostname that starts with it
-		// (e.g. "github.com.evil.com") will be corrupted by the bare targetHost
-		// replacement.  This is a known limitation of the plain-text scan and
-		// only occurs if adversarially controlled upstream content is proxied.
+		// Boundary guard: "sub-github.com" has "github.com" as a substring of a
+		// different root domain — must NOT be corrupted.
+		{`url(//sub-github.com/asset.js)`, `url(//sub-github.com/asset.js)`},
 	}
 
 	for _, c := range cases {
-		got := maskResponseString(c.in, target, computeRootDomain(target), proxy, re)
+		got := maskResponseString(c.in, target, computeRootDomain(target), proxy, re, buildTestBareTargetRe(target))
 		if got != c.want {
 			t.Errorf("maskResponseString(2-label) %q\n  got  %q\n  want %q", c.in, got, c.want)
 		}
@@ -598,7 +613,7 @@ func TestMaskResponseStringExactDomainNoSubdomainRe(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		got := maskResponseString(c.in, target, computeRootDomain(target), proxy, nil)
+		got := maskResponseString(c.in, target, computeRootDomain(target), proxy, nil, buildTestBareTargetRe(target))
 		if got != c.want {
 			t.Errorf("maskResponseStringExact(%q) = %q, want %q", c.in, got, c.want)
 		}
@@ -606,6 +621,40 @@ func TestMaskResponseStringExactDomainNoSubdomainRe(t *testing.T) {
 }
 
 // ---- Bug-fix regression tests ----
+
+// TestMaskResponseStringDomainBoundary is a regression test for the bug where
+// step 4's bare targetHost scan would corrupt domains that share targetHost as
+// a substring but have a different root domain.
+// Bug: target="microsoft.com", body contains "//c.s-microsoft.com/font.woff2"
+//      (c.s-microsoft.com has root domain "s-microsoft.com", not "microsoft.com")
+//      → step 4 used to replace "microsoft.com" → "localhost:9001" giving
+//        "//c.s-localhost:9001/font.woff2" (broken URL).
+func TestMaskResponseStringDomainBoundary(t *testing.T) {
+	target := "microsoft.com"
+	proxy := "localhost:9001"
+	re := buildTestSubdomainRe(target)
+
+	cases := []struct{ in, want string }{
+		// The core bug: "c.s-microsoft.com" is NOT a subdomain of "microsoft.com"
+		// (its root domain is "s-microsoft.com"), so it must pass through unchanged.
+		{`url(//c.s-microsoft.com/font.woff2)`, `url(//c.s-microsoft.com/font.woff2)`},
+		// Similarly, "target.microsoft.com" in a bare (no-scheme) context has a dot
+		// before microsoft.com — the bare scan must leave it intact (subdomainRe handles
+		// URL-scheme contexts).
+		{`target.microsoft.com/rest/v1`, `target.microsoft.com/rest/v1`},
+		// Legitimate bare targetHost replacements must still work.
+		{`Domain=microsoft.com; Path=/`, `Domain=localhost:9001; Path=/`},
+		{`visit microsoft.com today`, `visit localhost:9001 today`},
+		{`microsoft.com/pricing`, `localhost:9001/pricing`},
+	}
+
+	for _, c := range cases {
+		got := maskResponseString(c.in, target, computeRootDomain(target), proxy, re, buildTestBareTargetRe(target))
+		if got != c.want {
+			t.Errorf("maskResponseString(domain-boundary) %q\n  got  %q\n  want %q", c.in, got, c.want)
+		}
+	}
+}
 
 // TestSSRFBlockedViaSdPath verifies that /__sd__/<host> requests for hosts that
 // are NOT under the rootDomain are blocked and do not proxy to arbitrary hosts.

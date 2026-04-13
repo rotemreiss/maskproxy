@@ -2,6 +2,7 @@ package main
 
 import (
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"io"
 	"net"
@@ -33,6 +34,12 @@ var hopByHopHeaders = map[string]bool{
 	"Transfer-Encoding":   true,
 	"Upgrade":             true,
 }
+
+// clientHostContextKey is used to thread the original client-facing Host
+// (e.g. "127.0.0.1:9001" or "localhost:9001") from the director to
+// modifyResponse via the request context.  Using a typed key avoids clashes
+// with other context values.
+type clientHostContextKey struct{}
 
 // absURLRe matches absolute and protocol-relative URLs (used to protect
 // external links from being corrupted by user-defined string replacements).
@@ -293,8 +300,11 @@ func computeRootDomain(host string) string {
 //
 //  3. "http://targetHost"  → "http://proxyAddr"  (absolute HTTP URLs)
 //
-//  4. bare "targetHost"    → proxyAddr           (hostname-only references, e.g.
-//     Set-Cookie Domain, Location without scheme, or plain text mentions)
+//  4. bare "targetHost"    → proxyAddr (hostname-only references, e.g.
+//     Set-Cookie Domain, Location without scheme, or plain text mentions).
+//     Uses bareTargetRe (domain-boundary-aware regex) to avoid corrupting domains
+//     that share targetHost as a substring, e.g. "c.s-microsoft.com" must not
+//     become "c.s-localhost:9001" when targetHost="microsoft.com".
 //
 //  5. When rootDomain differs from targetHost (e.g. targetHost="www.bbc.com",
 //     rootDomain="bbc.com"): also rewrite "https://rootDomain" and
@@ -303,7 +313,11 @@ func computeRootDomain(host string) string {
 // This MUST run before user-supplied replacements.  If the user has -replace
 // ctf:acme, then "ctf.io" would become "acme.io" before we can substitute it
 // with "localhost:8080", leaving the upstream hostname partially visible.
-func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe *regexp.Regexp) string {
+//
+// bareTargetRe matches targetHost only when NOT preceded or followed by a
+// domain-continuation character (letter, digit, hyphen, dot), preventing
+// substring corruption in unrelated hostnames.
+func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe, bareTargetRe *regexp.Regexp) string {
 	if proxyAddr == "" {
 		return s
 	}
@@ -358,7 +372,13 @@ func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe
 	// Steps 2-4: rewrite the exact target host in scheme+host and bare forms.
 	s = strings.ReplaceAll(s, "https://"+targetHost, proxyBase)
 	s = strings.ReplaceAll(s, "http://"+targetHost, proxyBase)
-	s = strings.ReplaceAll(s, targetHost, proxyAddr)
+	// Step 4: bare targetHost scan with domain-boundary guards.
+	// Using regex instead of strings.ReplaceAll to avoid corrupting domains where
+	// targetHost appears as a suffix (e.g. "c.s-microsoft.com" when target="microsoft.com").
+	// Group 1 = preceding boundary char (preserved), Group 2 = trailing boundary char (preserved).
+	if bareTargetRe != nil {
+		s = bareTargetRe.ReplaceAllString(s, "${1}"+proxyAddr+"${2}")
+	}
 
 	// Step 5: also mask the bare root domain when it differs from targetHost.
 	// e.g. target="www.bbc.com" but upstream emits canonical "https://bbc.com/".
@@ -534,6 +554,21 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		)
 	}
 
+	// bareTargetRe matches targetHost as a standalone hostname (step 4 in maskResponseString).
+	// Domain-boundary guards: requires that targetHost is NOT preceded or followed by a
+	// hostname-continuation character (letter, digit, hyphen, or dot).  This prevents
+	// corrupting unrelated domains that share targetHost as a substring.
+	// Example: target="microsoft.com" → "c.s-microsoft.com" must NOT become "c.s-localhost:9001".
+	// Group 1 = preceding boundary char, Group 2 = trailing boundary char (both preserved).
+	var bareTargetRe *regexp.Regexp
+	if proxyAddr != "" {
+		bareTargetRe = regexp.MustCompile(
+			`(?i)(^|[^-a-zA-Z0-9.])` +
+				regexp.QuoteMeta(targetHost) +
+				`([^-a-zA-Z0-9.]|$)`,
+		)
+	}
+
 	// Clone DefaultTransport to preserve connection-pooling and timeout settings,
 	// then override TLS config when certificate verification must be skipped and
 	// apply explicit per-phase timeouts to prevent hung upstreams from leaking
@@ -560,6 +595,19 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	var reqTimes sync.Map // key: *http.Request → value: time.Time
 
 	director := func(req *http.Request) {
+		// Capture the client-visible host (e.g. "127.0.0.1:9001" or "localhost:9001")
+		// before the director overwrites req.Host with the upstream target.
+		// modifyResponse reads this to rewrite redirect Location headers and body
+		// URLs with the same hostname the browser is using, preventing CORS errors
+		// when the browser follows redirects that cross 127.0.0.1 ↔ localhost.
+		clientHost := req.Host
+		if clientHost == "" {
+			clientHost = req.URL.Host
+		}
+		if clientHost != "" {
+			*req = *req.WithContext(context.WithValue(req.Context(), clientHostContextKey{}, clientHost))
+		}
+
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		// Set Host header explicitly so the upstream server receives the correct
@@ -691,6 +739,27 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			start = v.(time.Time)
 		}
 
+		// Per-request effective proxy address: use the client-facing Host that
+		// the browser sent (captured in the director via context) so that rewritten
+		// URLs in the response body and Location headers use the same hostname
+		// the browser used to connect.  This prevents CORS errors when the browser
+		// follows redirects: if the page was loaded from "127.0.0.1:9001", redirect
+		// Location headers must also point to "127.0.0.1:9001", not "localhost:9001".
+		//
+		// Safety guard: only substitute when the port matches proxyAddr's port.
+		// This ensures the override is only applied when the client is genuinely
+		// talking to this proxy (same port), and prevents test environments where
+		// a fixed proxyAddr (e.g. "masked.proxy:9999") is used but the test HTTP
+		// client connects to a random ephemeral port.
+		effectiveProxyAddr := proxyAddr
+		if ch, ok := resp.Request.Context().Value(clientHostContextKey{}).(string); ok && ch != "" {
+			_, proxyPort, err1 := net.SplitHostPort(proxyAddr)
+			_, clientPort, err2 := net.SplitHostPort(ch)
+			if err1 == nil && err2 == nil && clientPort == proxyPort {
+				effectiveProxyAddr = ch
+			}
+		}
+
 		// ── Redirect downgrade: 301 → 302, 308 → 307 ────────────────────────
 		// Browsers cache 301/308 (permanent) redirects indefinitely.  The
 		// Location URLs the proxy emits contain proxy-internal path prefixes
@@ -728,8 +797,8 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 				continue
 			}
 			for i, v := range vals {
-				v = maskResponseString(v, targetHost, rootDomain, proxyAddr, subdomainRe)
-				v = withExternalURLsProtected(v, "http://"+proxyAddr, rep.ToAlias)
+				v = maskResponseString(v, targetHost, rootDomain, effectiveProxyAddr, subdomainRe, bareTargetRe)
+				v = withExternalURLsProtected(v, "http://"+effectiveProxyAddr, rep.ToAlias)
 				resp.Header[key][i] = v
 			}
 		}
@@ -815,7 +884,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		//
 		// We also count how many user-substitutions happened so the log line can
 		// report "[N replaced]" even in non-verbose mode.
-		rewritten := maskResponseString(string(raw), targetHost, rootDomain, proxyAddr, subdomainRe)
+		rewritten := maskResponseString(string(raw), targetHost, rootDomain, effectiveProxyAddr, subdomainRe, bareTargetRe)
 
 		// Pass 2: if this response came from a subdomain host (not the main target),
 		// rewrite root-relative paths so browsers resolve them against the subdomain
@@ -825,7 +894,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		}
 
 		var replaceCount int
-		rewritten = withExternalURLsProtected(rewritten, "http://"+proxyAddr, func(s string) string {
+		rewritten = withExternalURLsProtected(rewritten, "http://"+effectiveProxyAddr, func(s string) string {
 			var n int
 			s, n = rep.ToAliasDiff(s)
 			replaceCount += n
