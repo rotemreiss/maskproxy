@@ -1918,3 +1918,42 @@ func TestChunkedResponseBodyRewrite(t *testing.T) {
 		t.Error("Content-Length header missing after rewrite")
 	}
 }
+
+// TestSubdomainRedirectLocationRewrite verifies that a root-relative Location
+// redirect from a subdomain response is prefixed with /__sd__/<host> so the
+// browser stays within the proxy's routing rather than navigating to the main
+// target root.
+func TestSubdomainRedirectLocationRewrite(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/dashboard", http.StatusFound)
+	}))
+	defer upstream.Close()
+
+	rootHost := "example.com"
+	subHost := "api.example.com"
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(rootHost, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil)
+	// Route all connections to the test upstream regardless of requested host.
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	client := ps.Client()
+	// Disable redirect following so we can inspect the Location header.
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := client.Get(ps.URL + "/__sd__/" + subHost + "/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	loc := resp.Header.Get("Location")
+	expected := "/__sd__/" + subHost + "/dashboard"
+	if loc != expected {
+		t.Errorf("Location header = %q; want %q", loc, expected)
+	}
+}

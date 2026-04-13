@@ -1272,12 +1272,26 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		}
 
 		// Rewrite all other headers (Location, Link, Content-Location, …).
+		// For subdomain-routed responses, also prefix any root-relative Location
+		// value with /__sd__/<host> so redirects stay within the proxy's routing.
+		// e.g. "Location: /login" from sub.host.com → "Location: /__sd__/sub.host.com/login"
+		headerSubHost := ""
+		if rh := resp.Request.URL.Host; !strings.EqualFold(rh, targetHost) && rh != "" {
+			headerSubHost = rh
+		}
 		for key, vals := range resp.Header {
 			if headersSkipRewrite[key] {
 				continue
 			}
 			for i, v := range vals {
 				v = maskResponseString(v, targetHost, rootDomain, effectiveProxyAddr, subdomainRe, bareTargetRe)
+				// Prefix root-relative Location/Content-Location values with the
+				// subdomain routing path so the browser doesn't escape to the main target.
+				if headerSubHost != "" && (key == "Location" || key == "Content-Location") {
+					if strings.HasPrefix(v, "/") && !strings.HasPrefix(v, "//") && !strings.HasPrefix(v, subdomainPrefix) {
+						v = subdomainPrefix + headerSubHost + v
+					}
+				}
 				v = withExternalURLsProtected(v, "http://"+effectiveProxyAddr, rep.ToAlias)
 				resp.Header[key][i] = v
 			}
