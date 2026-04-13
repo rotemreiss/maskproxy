@@ -856,9 +856,44 @@ func isIgnoredHost(host string, ignoredHosts map[string]bool) bool {
 // an outbound request so that proxy-address references become the upstream host.
 // This MUST run after user-supplied replacements (which convert aliases to
 // originals) so that the final header/body value is fully upstream-native.
+//
+// Special case: subdomain proxy paths of the form
+//   http://proxyAddr/__sd__/<subHost>/path
+// must be unwound to their original upstream URL:
+//   https://<subHost>/path
+// Without this, Referer and Origin headers sent from a /__sd__/ page would
+// become "https://targetHost/__sd__/sub.host/path" — wrong upstream host.
 func unmaskRequestString(s, targetHost, scheme, proxyAddr string) string {
 	if proxyAddr == "" {
 		return s
+	}
+	// Rewrite /__sd__/<subHost>/... form first, before the plain proxy-base
+	// replacement, so we don't end up with "https://targetHost/__sd__/..." as
+	// an intermediate that then fails the next ReplaceAll.
+	sdPrefix := "http://" + proxyAddr + subdomainPrefix
+	for {
+		idx := strings.Index(s, sdPrefix)
+		if idx < 0 {
+			break
+		}
+		rest := s[idx+len(sdPrefix):]
+		// Extract <subHost> (everything up to the first '/' or end of string).
+		var subHost, subPath string
+		if end := strings.IndexByte(rest, '/'); end < 0 {
+			// No trailing slash — reconstruct as "scheme://subHost/"
+			subHost = rest
+			subPath = "/"
+			// consumed characters in original string: len(sdPrefix) + len(subHost)
+			s = s[:idx] + scheme + "://" + subHost + subPath + s[idx+len(sdPrefix)+len(subHost):]
+		} else {
+			subHost = rest[:end]
+			subPath = rest[end:] // includes leading '/'
+			// consumed characters: len(sdPrefix) + len(subHost) + len(subPath)
+			s = s[:idx] + scheme + "://" + subHost + subPath + s[idx+len(sdPrefix)+len(subHost)+len(subPath):]
+		}
+		if subHost == "" {
+			break
+		}
 	}
 	upstreamBase := scheme + "://" + targetHost
 	s = strings.ReplaceAll(s, "http://"+proxyAddr, upstreamBase)

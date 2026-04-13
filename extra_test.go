@@ -132,6 +132,24 @@ func TestUnmaskRequestString(t *testing.T) {
 			target: "ctf.io", scheme: "https", proxy: "localhost:8080",
 			want: "//ctf.io/static/app.js",
 		},
+		{
+			desc:   "Referer from /__sd__/ page gets correct subdomain host",
+			in:     "http://localhost:8080/__sd__/api.ctf.io/path?q=1",
+			target: "ctf.io", scheme: "https", proxy: "localhost:8080",
+			want: "https://api.ctf.io/path?q=1",
+		},
+		{
+			desc:   "Referer from /__sd__/ page with no trailing path",
+			in:     "http://localhost:8080/__sd__/api.ctf.io",
+			target: "ctf.io", scheme: "https", proxy: "localhost:8080",
+			want: "https://api.ctf.io/",
+		},
+		{
+			desc:   "multiple /__sd__/ occurrences all rewritten",
+			in:     "x=http://localhost:8080/__sd__/a.ctf.io/p&y=http://localhost:8080/__sd__/b.ctf.io/q",
+			target: "ctf.io", scheme: "https", proxy: "localhost:8080",
+			want: "x=https://a.ctf.io/p&y=https://b.ctf.io/q",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.desc, func(t *testing.T) {
