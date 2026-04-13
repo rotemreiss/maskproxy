@@ -1919,6 +1919,71 @@ func TestChunkedResponseBodyRewrite(t *testing.T) {
 	}
 }
 
+// TestSubdomainRefreshHeaderRewrite verifies that a root-relative Refresh header
+// (format: "N; url=/path") from a subdomain response gets its url= part prefixed
+// with /__sd__/<host> so timed redirects stay within the proxy's routing.
+func TestSubdomainRefreshHeaderRewrite(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Refresh", "0; url=/login")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	rootHost := "example.com"
+	subHost := "api.example.com"
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(rootHost, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/__sd__/" + subHost + "/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	refresh := resp.Header.Get("Refresh")
+	expected := "0; url=/__sd__/" + subHost + "/login"
+	if refresh != expected {
+		t.Errorf("Refresh header = %q; want %q", refresh, expected)
+	}
+}
+
+// TestMetaRefreshBodyRewrite verifies that <meta http-equiv="refresh"> with a
+// root-relative url= in the body gets the url= path prefixed with /__sd__/<host>.
+func TestMetaRefreshBodyRewrite(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<html><head><meta http-equiv="refresh" content="5; url=/dashboard"></head></html>`))
+	}))
+	defer upstream.Close()
+
+	rootHost := "example.com"
+	subHost := "api.example.com"
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(rootHost, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/__sd__/" + subHost + "/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	expected := `content="5; url=/__sd__/` + subHost + `/dashboard"`
+	if !strings.Contains(string(body), expected) {
+		t.Errorf("body does not contain rewritten meta refresh\ngot:  %s\nwant: %s", string(body), expected)
+	}
+}
+
 // TestSubdomainRedirectLocationRewrite verifies that a root-relative Location
 // redirect from a subdomain response is prefixed with /__sd__/<host> so the
 // browser stays within the proxy's routing rather than navigating to the main

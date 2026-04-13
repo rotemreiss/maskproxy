@@ -79,6 +79,12 @@ var srcsetAttrRe = regexp.MustCompile(`(?i)(srcset\s*=\s*["'])([^"']*)`)
 // Group 2 = the root-relative path.
 var rootRelativeCSSRe = regexp.MustCompile(`(?i)(url\s*\(\s*["']?)(/[^"')<>\s]*)`)
 
+// metaRefreshRe matches the url= part inside <meta http-equiv="refresh" content="…">.
+// Format: content="<seconds>; url=<path>"
+// Group 1 = everything up to and including "url=" (preserves the "N; url=" prefix).
+// Group 2 = the root-relative path (starts with /).
+var metaRefreshRe = regexp.MustCompile(`(?i)(content\s*=\s*["'][0-9]+\s*;\s*url=)(/[^"'<>\s]*)`)
+
 // maxBodyRewrite is the maximum response body size (in bytes) that will be
 // buffered and rewritten. Responses larger than this are forwarded unchanged to
 // prevent out-of-memory conditions when proxying large file downloads.
@@ -494,6 +500,15 @@ func rewriteRootRelativePaths(s, subHost string) string {
 	// Rewrite CSS url() expressions.
 	s = rootRelativeCSSRe.ReplaceAllStringFunc(s, func(m string) string {
 		sub := rootRelativeCSSRe.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		return sub[1] + rewritePath(sub[2])
+	})
+
+	// Rewrite <meta http-equiv="refresh" content="N; url=/path"> values.
+	s = metaRefreshRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := metaRefreshRe.FindStringSubmatch(m)
 		if len(sub) < 3 {
 			return m
 		}
@@ -1271,10 +1286,12 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			}
 		}
 
-		// Rewrite all other headers (Location, Link, Content-Location, …).
-		// For subdomain-routed responses, also prefix any root-relative Location
+		// Rewrite all other headers (Location, Link, Content-Location, Refresh …).
+		// For subdomain-routed responses, also prefix any root-relative redirect
 		// value with /__sd__/<host> so redirects stay within the proxy's routing.
-		// e.g. "Location: /login" from sub.host.com → "Location: /__sd__/sub.host.com/login"
+		// Handles:
+		//   Location: /login       → Location: /__sd__/sub.host.com/login
+		//   Refresh: 0; url=/login → Refresh: 0; url=/__sd__/sub.host.com/login
 		headerSubHost := ""
 		if rh := resp.Request.URL.Host; !strings.EqualFold(rh, targetHost) && rh != "" {
 			headerSubHost = rh
@@ -1285,11 +1302,21 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			}
 			for i, v := range vals {
 				v = maskResponseString(v, targetHost, rootDomain, effectiveProxyAddr, subdomainRe, bareTargetRe)
-				// Prefix root-relative Location/Content-Location values with the
-				// subdomain routing path so the browser doesn't escape to the main target.
-				if headerSubHost != "" && (key == "Location" || key == "Content-Location") {
-					if strings.HasPrefix(v, "/") && !strings.HasPrefix(v, "//") && !strings.HasPrefix(v, subdomainPrefix) {
-						v = subdomainPrefix + headerSubHost + v
+				if headerSubHost != "" {
+					switch key {
+					case "Location", "Content-Location":
+						// Plain URL value — prefix root-relative paths.
+						if strings.HasPrefix(v, "/") && !strings.HasPrefix(v, "//") && !strings.HasPrefix(v, subdomainPrefix) {
+							v = subdomainPrefix + headerSubHost + v
+						}
+					case "Refresh":
+						// Format: "N" or "N; url=<url>" — fix the url= part if present.
+						if idx := strings.Index(strings.ToLower(v), "url="); idx >= 0 {
+							urlPart := v[idx+4:]
+							if strings.HasPrefix(urlPart, "/") && !strings.HasPrefix(urlPart, "//") && !strings.HasPrefix(urlPart, subdomainPrefix) {
+								v = v[:idx+4] + subdomainPrefix + headerSubHost + urlPart
+							}
+						}
 					}
 				}
 				v = withExternalURLsProtected(v, "http://"+effectiveProxyAddr, rep.ToAlias)
