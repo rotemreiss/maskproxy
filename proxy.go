@@ -205,18 +205,25 @@ const subdomainSPAScript = `<script>(function(){` +
 	`if(typeof url==='string'&&url.startsWith('/')&&!url.startsWith('/__sd__/'))url=pfx+url;` +
 	`return o(url);};});` +
 	// Patch window.fetch for root-relative API calls.
-	// Handles both string URLs and Request objects.
+	// Handles string URLs, Request objects, and URL objects.
 	`var oF=window.fetch;` +
 	`window.fetch=function(i,o){` +
-	`if(typeof i==='string'&&i.startsWith('/')&&!i.startsWith('/__sd__/'))i=pfx+i;` +
-	`else if(i&&typeof i==='object'&&i.url&&i.url.startsWith(location.origin+'/')` +
-	`&&!i.url.slice(location.origin.length).startsWith('/__sd__/'))` +
-	`i=new Request(location.origin+pfx+i.url.slice(location.origin.length),i);` +
+	`var s=typeof i==='string'?i:(i instanceof URL?i.href:(i&&i.url?i.url:''));` +
+	`if(s.startsWith('/')&&!s.startsWith('/__sd__/')){` +
+	`if(typeof i==='string')i=pfx+i;` +
+	`else if(i instanceof URL)i=new URL(pfx+i.pathname+i.search+i.hash,i.origin);` +
+	`else if(i&&i.url)i=new Request(location.origin+pfx+i.url.slice(location.origin.length),i);}` +
+	`else if(s.startsWith(location.origin+'/')&&!s.slice(location.origin.length).startsWith('/__sd__/')){` +
+	`if(typeof i==='string')i=location.origin+pfx+i.slice(location.origin.length);` +
+	`else if(i instanceof URL)i=new URL(pfx+i.pathname+i.search+i.hash,i.origin);` +
+	`else if(i&&i.url)i=new Request(location.origin+pfx+i.url.slice(location.origin.length),i);}` +
 	`return oF.call(this,i,o);};` +
 	// Patch XMLHttpRequest.open for root-relative XHR calls.
 	`var oX=XMLHttpRequest.prototype.open;` +
 	`XMLHttpRequest.prototype.open=function(m,u){` +
+	`if(u instanceof URL)u=u.href;` +
 	`if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/'))u=pfx+u;` +
+	`else if(typeof u==='string'&&u.startsWith(location.origin+'/')&&!u.slice(location.origin.length).startsWith('/__sd__/'))u=location.origin+pfx+u.slice(location.origin.length);` +
 	`return oX.apply(this,arguments);};` +
 	// Patch navigator.sendBeacon for root-relative analytics/telemetry.
 	`if(navigator.sendBeacon){` +
