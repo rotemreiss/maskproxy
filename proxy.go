@@ -1085,10 +1085,25 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			// Validate: subHost must be the rootDomain itself, or a subdomain of it.
 			// A valid subdomain satisfies: strings.HasSuffix(subHost, "."+rootDomain)
 			// OR subHost == rootDomain (bare root, no subdomain label).
+			//
+			// Additionally, reject hosts containing characters that are illegal in
+			// DNS hostnames or that could be interpreted as URL authority components:
+			//   '@' — userinfo separator (e.g. "evil@real.domain.com" suffix-passes
+			//          the rootDomain check yet routes to a different host)
+			//   '/' — path separator
+			//   '\x00'–'\x1f', '\x7f'+ — control/non-ASCII characters
 			subHostLower := strings.ToLower(subHost)
 			rootLower := strings.ToLower(rootDomain)
-			validSubdomain := subHostLower == rootLower ||
-				strings.HasSuffix(subHostLower, "."+rootLower)
+			hostnameInvalid := func(h string) bool {
+				for _, c := range h {
+					if c < 0x21 || c > 0x7e || c == '@' || c == '/' {
+						return true
+					}
+				}
+				return false
+			}
+			validSubdomain := !hostnameInvalid(subHostLower) &&
+				(subHostLower == rootLower || strings.HasSuffix(subHostLower, "."+rootLower))
 			if !validSubdomain {
 				// Flag request as SSRF-blocked in the context.
 				// ssrfGuardTransport intercepts this and returns a 403 directly,
@@ -1406,9 +1421,9 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			logger.Printf("maskproxy: response body exceeds %d bytes; skipping rewrite", maxBodyRewrite)
 			logger.LogResponse(resp, "", start, 0)
 			if isGzip {
-				resp.Body = io.NopCloser(strings.NewReader(string(raw)))
+				resp.Body = io.NopCloser(bytes.NewReader(raw))
 			} else {
-				resp.Body = io.NopCloser(io.MultiReader(strings.NewReader(string(raw)), resp.Body))
+				resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(raw), resp.Body))
 			}
 			return nil
 		}

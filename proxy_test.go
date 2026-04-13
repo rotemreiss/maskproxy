@@ -696,7 +696,35 @@ func TestSSRFBlockedViaSdPath(t *testing.T) {
 	}
 }
 
-// TestSdHostUserReplaceApplied verifies that user alias replacements ARE applied
+// TestSSRFBlockedAtSignBypass verifies that a crafted /__sd__/ host containing
+// "@" (e.g. "evil.com:80@real.rootdomain.com") is rejected by the SSRF guard
+// even though it passes a naive HasSuffix(".rootdomain.com") check.
+func TestSSRFBlockedAtSignBypass(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	targetHost := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(targetHost, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	// Craft a host that suffix-matches targetHost but contains "@".
+	// e.g. "evil.com:80@127.0.0.1" where targetHost is "127.0.0.1:PORT"
+	bypassHost := "evil.com:80@" + targetHost
+	resp, err := ps.Client().Get(ps.URL + "/__sd__/" + bypassHost + "/secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for @-bypass attempt, got %d", resp.StatusCode)
+	}
+}
+
+
 // inside /__sd__/<host>/ path segments, so the client-visible URL is consistent
 // with the replacement alias.
 //
