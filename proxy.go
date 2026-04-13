@@ -90,22 +90,22 @@ const subdomainPrefix = "/__sd__/"
 // headersSkipRewrite is the set of response headers managed explicitly by the
 // proxy that must not be touched by the generic header-rewrite loop.
 var headersSkipRewrite = map[string]bool{
-	"Content-Length":    true,
-	"Content-Encoding":  true,
-	"Transfer-Encoding": true,
-	"Set-Cookie":        true, // handled by rewriteSetCookies
+	"Content-Length":                     true,
+	"Content-Encoding":                   true,
+	"Transfer-Encoding":                  true,
+	"Set-Cookie":                         true, // handled by rewriteSetCookies
+	"Content-Security-Policy":            true, // handled by rewriteCSP
+	"Content-Security-Policy-Report-Only": true, // handled by rewriteCSP
 }
 
 // headersStrip is the set of response headers that must be removed entirely.
-// These headers are either tied to the upstream origin (CSP, HSTS) and would
-// break the proxy, or expose security metadata the masking proxy must hide.
+// These headers are either tied to the upstream origin and would break the
+// proxy, or expose security metadata the masking proxy must hide.
 var headersStrip = map[string]bool{
-	"Content-Security-Policy":            true, // domain-pinned; breaks when origin changes to localhost
-	"Content-Security-Policy-Report-Only": true,
-	"Strict-Transport-Security":          true, // HSTS on plain-HTTP proxy confuses browsers
-	"Public-Key-Pins":                    true,
-	"Public-Key-Pins-Report-Only":        true,
-	"Expect-CT":                          true,
+	"Strict-Transport-Security":   true, // HSTS on plain-HTTP proxy confuses browsers
+	"Public-Key-Pins":             true,
+	"Public-Key-Pins-Report-Only": true,
+	"Expect-CT":                   true,
 }
 
 // textContentTypes lists MIME type prefixes for which body replacement is safe.
@@ -484,6 +484,113 @@ func rewriteRootRelativePaths(s, subHost string) string {
 	return s
 }
 
+// rewriteCSP rewrites a Content-Security-Policy (or CSP-Report-Only) header
+// value so that all host-source references to the proxied target domain are
+// replaced with the proxy's own address.  This lets the browser load resources
+// through the proxy without violating the policy.
+//
+// Rewriting rules per source token:
+//   - `'self'`, `'nonce-…'`, `'sha256-…'`, `'unsafe-inline'`, etc. → unchanged
+//   - `https://target.com`   → `http://proxyAddr`
+//   - `https://*.target.com` → `http://proxyAddr`  (wildcard; all subdomains
+//     are served from the same proxy origin via /__sd__/)
+//   - `wss://target.com`     → `ws://proxyAddr`     (WebSocket scheme downgrade)
+//   - `*.target.com`         → `proxyAddr`           (no scheme)
+//   - `target.com`           → `proxyAddr`
+//   - Non-target tokens      → unchanged
+//
+// `report-uri` and `report-to` directives are dropped: they would send
+// violation reports to the upstream's collection endpoint, leaking traffic
+// and the real hostname.
+func rewriteCSP(csp, targetHost, rootDomain, proxyAddr string) string {
+	if proxyAddr == "" || csp == "" {
+		return csp
+	}
+	targetLower := strings.ToLower(targetHost)
+	rootLower := strings.ToLower(rootDomain)
+
+	directives := strings.Split(csp, ";")
+	out := make([]string, 0, len(directives))
+
+	for _, dir := range directives {
+		trimmed := strings.TrimSpace(dir)
+		if trimmed == "" {
+			continue
+		}
+		tokens := strings.Fields(trimmed)
+		if len(tokens) == 0 {
+			continue
+		}
+		// Drop violation-reporting directives — they reference upstream endpoints.
+		name := strings.ToLower(tokens[0])
+		if name == "report-uri" || name == "report-to" {
+			continue
+		}
+
+		rewritten := make([]string, len(tokens))
+		rewritten[0] = tokens[0] // directive name unchanged
+		for i, tok := range tokens[1:] {
+			rewritten[i+1] = rewriteCSPToken(tok, targetLower, rootLower, proxyAddr)
+		}
+		out = append(out, strings.Join(rewritten, " "))
+	}
+	return strings.Join(out, "; ")
+}
+
+// rewriteCSPToken rewrites a single CSP source token if it references the
+// proxied target domain or any of its subdomains.
+func rewriteCSPToken(token, targetLower, rootLower, proxyAddr string) string {
+	// CSP keywords always start with a single-quote — leave them untouched.
+	if strings.HasPrefix(token, "'") {
+		return token
+	}
+	// Lowercase for matching only; we'll build the output from scratch.
+	lower := strings.ToLower(token)
+
+	// Extract and strip optional scheme prefix.
+	scheme := ""
+	rest := lower
+	for _, s := range []string{"https://", "http://", "wss://", "ws://"} {
+		if strings.HasPrefix(rest, s) {
+			scheme = s
+			rest = rest[len(s):]
+			break
+		}
+	}
+
+	// Strip optional wildcard subdomain prefix "*.".
+	rest = strings.TrimPrefix(rest, "*.")
+
+	// Strip optional port suffix to isolate the bare hostname.
+	host := rest
+	if i := strings.LastIndex(rest, ":"); i >= 0 {
+		host = rest[:i]
+	}
+
+	// Check whether the host belongs to the target domain (exact match or subdomain).
+	isTarget := host == targetLower ||
+		strings.HasSuffix(host, "."+targetLower) ||
+		host == rootLower ||
+		strings.HasSuffix(host, "."+rootLower)
+
+	if !isTarget {
+		return token
+	}
+
+	// Map scheme: wss → ws (proxy is plain HTTP); everything else → http.
+	switch scheme {
+	case "wss://":
+		return "ws://" + proxyAddr
+	case "", "https://", "http://":
+		if scheme == "" {
+			return proxyAddr
+		}
+		return "http://" + proxyAddr
+	default:
+		return "http://" + proxyAddr
+	}
+}
+
 // unmaskRequestString is the reverse of maskResponseString: it rewrites s from
 // an outbound request so that proxy-address references become the upstream host.
 // This MUST run after user-supplied replacements (which convert aliases to
@@ -786,9 +893,19 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		rewriteSetCookies(resp, false /* proxy listens on plain HTTP */)
 
 		// Strip headers that are tied to the upstream origin and would break
-		// the proxy (CSP with upstream domain names, HSTS, key pinning).
+		// the proxy (HSTS, key pinning).
 		for key := range headersStrip {
 			resp.Header.Del(key)
+		}
+
+		// Rewrite Content-Security-Policy: replace target-domain host sources
+		// with the proxy's own address so the browser can load resources without
+		// CSP violations.  This is done separately from the generic loop because
+		// CSP values need token-level parsing (not simple string replacement).
+		for _, cspKey := range []string{"Content-Security-Policy", "Content-Security-Policy-Report-Only"} {
+			for i, v := range resp.Header[cspKey] {
+				resp.Header[cspKey][i] = rewriteCSP(v, targetHost, rootDomain, effectiveProxyAddr)
+			}
 		}
 
 		// Rewrite all other headers (Location, Link, Content-Location, …).

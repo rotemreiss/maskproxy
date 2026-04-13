@@ -541,10 +541,16 @@ func TestProxyRedirectDowngrade(t *testing.T) {
 }
 
 // TestProxyCSPHSTSStripped verifies that security headers which would break or
-// expose the proxy session are stripped from responses.
+// expose the proxy session are handled correctly:
+//   - CSP is REWRITTEN (not stripped) — target domains replaced with proxy addr
+//   - HSTS, HPKP, Expect-CT are still stripped entirely
 func TestProxyCSPHSTSStripped(t *testing.T) {
+	var upstreamHost string // set once we know the test server addr
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'self' https://ctf.io")
+		// CSP contains the upstream's own host (mirrors real-world behaviour where
+		// the server's CSP references its own domain).
+		w.Header().Set("Content-Security-Policy", "default-src 'self' https://"+upstreamHost)
 		w.Header().Set("Content-Security-Policy-Report-Only", "default-src 'self'")
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		w.Header().Set("Public-Key-Pins", `pin-sha256="abc"; max-age=60`)
@@ -554,9 +560,9 @@ func TestProxyCSPHSTSStripped(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	host := strings.TrimPrefix(upstream.URL, "http://")
+	upstreamHost = strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -566,14 +572,21 @@ func TestProxyCSPHSTSStripped(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	stripped := []string{
-		"Content-Security-Policy",
-		"Content-Security-Policy-Report-Only",
-		"Strict-Transport-Security",
-		"Public-Key-Pins",
-		"Expect-CT",
+	// CSP must be PRESENT (rewritten, not stripped).
+	csp := resp.Header.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Error("Content-Security-Policy should be present (rewritten, not stripped)")
+	} else if strings.Contains(csp, upstreamHost) {
+		t.Errorf("Content-Security-Policy still contains upstream host: %q", csp)
 	}
-	for _, h := range stripped {
+
+	// report-only CSP with no target-domain refs passes through unchanged.
+	if v := resp.Header.Get("Content-Security-Policy-Report-Only"); v == "" {
+		t.Error("Content-Security-Policy-Report-Only should be present")
+	}
+
+	// Security headers that reveal upstream identity must be stripped entirely.
+	for _, h := range []string{"Strict-Transport-Security", "Public-Key-Pins", "Expect-CT"} {
 		if v := resp.Header.Get(h); v != "" {
 			t.Errorf("header %q should be stripped, got %q", h, v)
 		}
@@ -1046,5 +1059,141 @@ func TestProxyResponseHostAndUserReplacementCombined(t *testing.T) {
 	want := fmt.Sprintf(`<a href="http://%s/acme/page">link</a>`, proxyAddr)
 	if got != want {
 		t.Errorf("combined masking:\n  got  %q\n  want %q", got, want)
+	}
+}
+
+// ─── rewriteCSP ──────────────────────────────────────────────────────────────
+
+func TestRewriteCSP(t *testing.T) {
+const target = "microsoft.com"
+const root = "microsoft.com"
+const proxy = "localhost:9001"
+
+cases := []struct {
+name string
+in   string
+want string
+}{
+{
+name: "https scheme replaced with http://proxy",
+in:   "default-src 'self' https://microsoft.com",
+want: "default-src 'self' http://localhost:9001",
+},
+{
+name: "wildcard subdomain collapses to proxy addr",
+in:   "script-src 'self' *.microsoft.com",
+want: "script-src 'self' localhost:9001",
+},
+{
+name: "https wildcard subdomain → http://proxy",
+in:   "img-src https://*.microsoft.com",
+want: "img-src http://localhost:9001",
+},
+{
+name: "wss scheme becomes ws://proxy",
+in:   "connect-src wss://microsoft.com",
+want: "connect-src ws://localhost:9001",
+},
+{
+name: "bare host replaced",
+in:   "font-src microsoft.com",
+want: "font-src localhost:9001",
+},
+{
+name: "named subdomain replaced",
+in:   "script-src cdn.microsoft.com",
+want: "script-src localhost:9001",
+},
+{
+name: "report-uri directive dropped",
+in:   "default-src 'self'; report-uri https://csp.microsoft.com/report",
+want: "default-src 'self'",
+},
+{
+name: "report-to directive dropped",
+in:   "default-src 'self'; report-to csp-endpoint",
+want: "default-src 'self'",
+},
+{
+name: "non-target domain unchanged",
+in:   "img-src https://cdn.google.com",
+want: "img-src https://cdn.google.com",
+},
+{
+name: "keywords preserved",
+in:   "script-src 'self' 'nonce-abc123' 'sha256-abc' 'unsafe-inline'",
+want: "script-src 'self' 'nonce-abc123' 'sha256-abc' 'unsafe-inline'",
+},
+{
+name: "multiple directives all rewritten",
+in:   "default-src 'self' https://microsoft.com; script-src *.microsoft.com 'nonce-x'; connect-src wss://api.microsoft.com",
+want: "default-src 'self' http://localhost:9001; script-src localhost:9001 'nonce-x'; connect-src ws://localhost:9001",
+},
+{
+name: "empty CSP unchanged",
+in:   "",
+want: "",
+},
+{
+name: "proxyAddr empty disables rewriting",
+// tested by calling rewriteCSP with empty proxyAddr
+in:   "default-src https://microsoft.com",
+want: "default-src https://microsoft.com",
+},
+}
+
+for _, tc := range cases {
+t.Run(tc.name, func(t *testing.T) {
+pa := proxy
+if tc.name == "proxyAddr empty disables rewriting" {
+pa = ""
+}
+got := rewriteCSP(tc.in, target, root, pa)
+if got != tc.want {
+t.Errorf("\n  got  %q\n  want %q", got, tc.want)
+}
+})
+}
+}
+
+// TestProxyCSPRewrittenInResponse is an integration test verifying that the
+// proxy rewrites Content-Security-Policy headers in real responses.
+func TestProxyCSPRewrittenInResponse(t *testing.T) {
+	const proxyAddr = "localhost:9003"
+	var upstreamHost string // filled after server starts
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate upstream CSP that references its own hostname (real-world pattern).
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self' https://"+upstreamHost+"; script-src *."+upstreamHost+"; report-uri https://"+upstreamHost+"/csp")
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "hello")
+	}))
+	defer upstream.Close()
+
+	upstreamHost = strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := http.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	csp := resp.Header.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Fatal("expected Content-Security-Policy header to be present (not stripped)")
+	}
+	if strings.Contains(csp, upstreamHost) {
+		t.Errorf("CSP still contains upstream host: %q", csp)
+	}
+	if strings.Contains(csp, "report-uri") {
+		t.Errorf("CSP report-uri not stripped: %q", csp)
+	}
+	if !strings.Contains(csp, "'self'") {
+		t.Errorf("CSP 'self' keyword was removed: %q", csp)
 	}
 }
