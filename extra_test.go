@@ -3158,3 +3158,38 @@ func TestManifestScopeSubdomainRewrite(t *testing.T) {
 		t.Errorf("start_url not rewritten; got: %s", bodyStr)
 	}
 }
+
+// TestImportMapSubdomainRewrite verifies that root-relative URL values inside
+// a <script type="importmap"> block are prefixed with /__sd__/<host>/ on
+// subdomain pages so ES module imports route to the correct upstream.
+func TestImportMapSubdomainRewrite(t *testing.T) {
+	const subHost = "app.example.com"
+	const pageBody = `<!DOCTYPE html><html><head>` +
+		`<script type="importmap">{"imports":{"/mod/a.js":"/mod/a.js","lodash":"/vendor/lodash.js"}}</script>` +
+		`</head><body></body></html>`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, pageBody)
+	}))
+	defer upstream.Close()
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy("example.com", "http", rep, false, "localhost:9051", false, 0, testLogger(), nil, nil, 0)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+	req, _ := http.NewRequest("GET", ps.URL+"/__sd__/"+subHost+"/", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	sdPfx := "/__sd__/" + subHost
+	bs := string(respBody)
+	if !strings.Contains(bs, sdPfx+"/mod/a.js") {
+		t.Errorf("importmap /mod/a.js not rewritten; got:\n%s", bs)
+	}
+	if !strings.Contains(bs, sdPfx+"/vendor/lodash.js") {
+		t.Errorf("importmap /vendor/lodash.js not rewritten; got:\n%s", bs)
+	}
+}

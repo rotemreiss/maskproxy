@@ -106,7 +106,20 @@ var baseHrefRe = regexp.MustCompile(`(?i)(<base[^>]+\bhref\s*=\s*)(["'])([^"']*)
 // Group 2 = the root-relative path value (e.g. `/`).
 var manifestRootRelativeRe = regexp.MustCompile(`("(?:scope|start_url)"\s*:\s*)"(/[^"]*)"`)
 
-// linkHeaderRe matches root-relative URLs inside Link header angle brackets.
+// importMapRe matches an entire <script type="importmap">…</script> block.
+// Import maps define module specifier → URL mappings used by ES module `import`
+// statements.  Root-relative URL values (e.g. "/app/module.js") inside the JSON
+// body resolve against the browser's base URL, which for subdomain pages is the
+// proxy root — not the subdomain route.  We capture the entire block for targeted
+// JSON-string-value rewriting.
+var importMapRe = regexp.MustCompile(`(?si)<script[^>]+type\s*=\s*["']importmap["'][^>]*>(.*?)</script>`)
+
+// importMapValueRe matches JSON string values that are root-relative paths inside
+// an importmap script block (after the block has been isolated by importMapRe).
+// Group 1 = the opening double-quote.
+// Group 2 = the root-relative path.
+// Group 3 = the closing double-quote.
+var importMapValueRe = regexp.MustCompile(`"(/[^"]*)"`)
 // Format: `</path/to/resource>; rel=preload`
 // Group 1 = the root-relative path (the part between < and >).
 var linkHeaderRe = regexp.MustCompile(`<(/[^/][^>]*)>`)
@@ -757,6 +770,37 @@ func rewriteRootRelativePaths(s, subHost string) string {
 			return m
 		}
 		return sub[1] + rewritePath(sub[2])
+	})
+
+	// Rewrite root-relative URL values inside <script type="importmap"> blocks.
+	// Import maps define module specifier → URL mappings consumed by ES module
+	// import statements.  Example:
+	//   <script type="importmap">
+	//     {"imports": {"/app/chunk.js": "/app/chunk.js"}}
+	//   </script>
+	// For subdomain pages, the JSON string values are root-relative paths that
+	// resolve against the browser's base URL (proxy root, not the subdomain route).
+	// We find each importmap block and rewrite JSON string values that start with "/".
+	s = importMapRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := importMapRe.FindStringSubmatch(m)
+		if len(sub) < 2 {
+			return m
+		}
+		inner := sub[1]
+		rewrittenInner := importMapValueRe.ReplaceAllStringFunc(inner, func(jv string) string {
+			// jv is a full JSON string including quotes, e.g. `"/app/chunk.js"`
+			sub2 := importMapValueRe.FindStringSubmatch(jv)
+			if len(sub2) < 2 {
+				return jv
+			}
+			path := sub2[1]
+			if strings.HasPrefix(path, subdomainPrefix) || strings.HasPrefix(path, "//") {
+				return jv
+			}
+			return `"` + pfx + path + `"`
+		})
+		// Reconstruct the full <script type="importmap"> block with the rewritten body.
+		return strings.Replace(m, inner, rewrittenInner, 1)
 	})
 
 	return s
