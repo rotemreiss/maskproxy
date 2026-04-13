@@ -586,6 +586,9 @@ func TestMaskResponseString2LabelTarget(t *testing.T) {
 		{"https://gist.github.com/", "http://localhost:8081/__sd__/gist.github.com/"},
 		// Bare target is handled by literal replacements (no prefix).
 		{"https://github.com/explore", "http://localhost:8081/explore"},
+		// Protocol-relative form of the exact target host must also be rewritten.
+		{"//github.com/explore", "//localhost:8081/explore"},
+		{`src="//github.com/logo.png"`, `src="//localhost:8081/logo.png"`},
 		// Boundary guard: "sub-github.com" has "github.com" as a substring of a
 		// different root domain — must NOT be corrupted.
 		{`url(//sub-github.com/asset.js)`, `url(//sub-github.com/asset.js)`},

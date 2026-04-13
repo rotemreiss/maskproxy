@@ -430,6 +430,12 @@ func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe
 	// Steps 2-4: rewrite the exact target host in scheme+host and bare forms.
 	s = strings.ReplaceAll(s, "https://"+targetHost, proxyBase)
 	s = strings.ReplaceAll(s, "http://"+targetHost, proxyBase)
+	// Also rewrite the protocol-relative form "//targetHost" (no scheme).
+	// This appears when upstream HTML uses src="//ctf.io/logo.png" style URLs.
+	// Step 1 (subdomainRe) covers "//sub.rootDomain" but not "//rootDomain" itself.
+	s = strings.ReplaceAll(s, "//"+targetHost+"/", "//"+proxyAddr+"/")
+	s = strings.ReplaceAll(s, "//"+targetHost+"\"", "//"+proxyAddr+"\"")
+	s = strings.ReplaceAll(s, "//"+targetHost+"'", "//"+proxyAddr+"'")
 	// Step 4: bare targetHost scan with domain-boundary guards.
 	// Using regex instead of strings.ReplaceAll to avoid corrupting domains where
 	// targetHost appears as a suffix (e.g. "c.s-microsoft.com" when target="microsoft.com").
@@ -443,6 +449,9 @@ func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe
 	if rootDomain != "" && rootDomain != targetHost {
 		s = strings.ReplaceAll(s, "https://"+rootDomain, proxyBase)
 		s = strings.ReplaceAll(s, "http://"+rootDomain, proxyBase)
+		s = strings.ReplaceAll(s, "//"+rootDomain+"/", "//"+proxyAddr+"/")
+		s = strings.ReplaceAll(s, "//"+rootDomain+"\"", "//"+proxyAddr+"\"")
+		s = strings.ReplaceAll(s, "//"+rootDomain+"'", "//"+proxyAddr+"'")
 		// Do NOT do a bare rootDomain scan here — "bbc.com" appears legitimately
 		// in third-party tracker query params (utm_source=bbc.com) and replacing
 		// it blindly would corrupt those partner URLs.
