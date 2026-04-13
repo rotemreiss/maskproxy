@@ -2923,6 +2923,9 @@ func TestSubdomainSPAScriptInjected(t *testing.T) {
 	if !strings.Contains(bodyStr, "window.fetch") {
 		t.Errorf("fetch patching not found in injected script:\n%s", bodyStr)
 	}
+	if !strings.Contains(bodyStr, "window.WebSocket") {
+		t.Errorf("WebSocket patching not found in injected script:\n%s", bodyStr)
+	}
 }
 
 // TestSubdomainSPAScriptNotInjectedForMainTarget verifies that the SPA script
