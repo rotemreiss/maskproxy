@@ -452,12 +452,16 @@ func TestProxySetCookieRewrite(t *testing.T) {
 func TestComputeRootDomain(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"www.ynet.co.il", "ynet.co.il"},
+		{"ynet.co.il", "ynet.co.il"},      // ccTLD — should NOT strip to co.il
+		{"bbc.co.uk", "bbc.co.uk"},         // ccTLD — should NOT strip to co.uk
+		{"www.bbc.co.uk", "bbc.co.uk"},     // 4-label ccTLD — strip www only
+		{"domain.com.au", "domain.com.au"}, // ccTLD — should NOT strip to com.au
 		{"app.logz.io", "logz.io"},
 		{"en.wikipedia.org", "wikipedia.org"},
 		{"github.com", "github.com"},
 		{"api.github.com", "github.com"},
 		{"a.b.example.com", "b.example.com"},
-		{"127.0.0.1", "127.0.0.1"},   // IP — unchanged
+		{"127.0.0.1", "127.0.0.1"},       // IP — unchanged
 		{"127.0.0.1:8080", "127.0.0.1"}, // IP+port — port stripped, IP unchanged
 	}
 	for _, c := range cases {

@@ -131,6 +131,8 @@ func main() {
 		root := computeRootDomain(*target)
 		if root != *target {
 			logger.Printf("  → subdomain masking: *.%s → proxy", root)
+		} else {
+			logger.Printf("  → subdomain masking: *.%s → proxy", *target)
 		}
 	}
 	if *verbose {

@@ -162,20 +162,36 @@ func rewriteSetCookies(resp *http.Response, proxyIsHTTPS bool) {
 	}
 }
 
+// knownSLDs is the set of well-known "second-level domain" labels that are
+// used as organisational separators beneath country-code TLDs (ccTLDs).
+// Examples: co.il, co.uk, com.au, net.nz, org.br, gov.au, ac.uk …
+// When stripping the leading label from a 3-label hostname would produce one
+// of these 2-label ccTLD-style suffixes, the original hostname is already the
+// registrable/root domain and should not be stripped further.
+var knownSLDs = map[string]bool{
+	"co": true, "com": true, "net": true, "org": true, "gov": true,
+	"edu": true, "ac": true, "mil": true, "biz": true, "info": true,
+	"ltd": true, "plc": true, "sch": true, "ne": true, "or": true,
+	"go": true, "med": true, "pro": true, "int": true,
+}
+
 // computeRootDomain strips the leading hostname label from host so that
 // the organisational / registrable domain is returned.  This is used to
 // identify all subdomains that belong to the same site.
 //
 // Examples:
 //
-//	"www.ynet.co.il"  → "ynet.co.il"
-//	"app.logz.io"     → "logz.io"
+//	"www.ynet.co.il"   → "ynet.co.il"
+//	"ynet.co.il"       → "ynet.co.il"   (already the registrable domain)
+//	"app.logz.io"      → "logz.io"
 //	"en.wikipedia.org" → "wikipedia.org"
 //	"github.com"       → "github.com"   (two labels, nothing to strip)
+//	"bbc.co.uk"        → "bbc.co.uk"    (co.uk is a ccTLD SLD — don't strip)
 //
 // The heuristic strips the first dot-separated label when there are three or
-// more labels.  This is correct for all common TLDs and even for two-label
-// ccTLD suffixes such as .co.il or .co.uk (e.g. www.ynet.co.il → ynet.co.il).
+// more labels, UNLESS doing so would leave a recognised two-label ccTLD-style
+// suffix (e.g. co.il, co.uk, com.au).  In that case the original hostname is
+// already the registrable domain and is returned unchanged.
 // A full Public Suffix List would be more precise but adds unnecessary weight.
 // IP addresses (IPv4 and IPv6) are returned unchanged.
 func computeRootDomain(host string) string {
@@ -191,7 +207,17 @@ func computeRootDomain(host string) string {
 	if len(parts) <= 2 {
 		return host // e.g. "github.com" — nothing to strip
 	}
-	return strings.Join(parts[1:], ".")
+	candidate := strings.Join(parts[1:], ".")
+	candidateParts := strings.Split(candidate, ".")
+	// If stripping one label would leave a 2-label ccTLD-style suffix where
+	// the first part is a known SLD label (co, com, net, org, gov, ac, …),
+	// the input is already the registrable domain — return it unchanged.
+	// Example: "ynet.co.il" → candidate "co.il" → first part "co" is a known
+	// SLD → return "ynet.co.il" (not "co.il").
+	if len(candidateParts) == 2 && knownSLDs[candidateParts[0]] {
+		return host
+	}
+	return candidate
 }
 
 // maskResponseString rewrites s from an upstream response so that the upstream
