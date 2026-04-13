@@ -1203,17 +1203,17 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// that if the client also sent the same header, our value wins.  This
 		// runs BEFORE the Accept-Encoding override below so that a user-supplied
 		// -header "Accept-Encoding: ..." cannot silently bypass the proxy's
-		// gzip-only enforcement (which is needed for correct body rewriting).
+		// encoding enforcement (gzip/deflate only, needed for body rewriting).
 		for _, h := range extraHeaders {
 			req.Header.Set(h.name, h.value)
 		}
 
 		// Limit accepted encodings to what we can transparently decompress.
-		// Other encodings (brotli, zstd) that Go stdlib cannot decode natively
-		// would reach ModifyResponse compressed and corrupt after string replacement.
+		// gzip and deflate are handled; brotli and zstd would reach ModifyResponse
+		// still compressed and corrupt after string replacement.
 		// This runs AFTER extraHeaders so our enforcement always wins.
 		req.Header.Del("Accept-Encoding")
-		req.Header.Add("Accept-Encoding", "gzip, identity")
+		req.Header.Add("Accept-Encoding", "gzip, deflate, identity")
 
 		// Strip client-supplied X-Forwarded-For to prevent header injection.
 		req.Header.Del("X-Forwarded-For")
@@ -1389,14 +1389,15 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		}
 
 		// Decompress gzip or deflate before string replacement.
-		// We force Accept-Encoding: gzip, identity on all requests, so upstreams
-		// should not send other encodings. But some servers ignore this and respond
-		// with deflate, br, or zstd. We handle gzip and deflate; anything else is
-		// forwarded unchanged to avoid corrupting compressed bytes.
+		// We advertise Accept-Encoding: gzip, deflate, identity. Anything else
+		// (br, zstd) is forwarded unchanged to avoid corrupting compressed bytes.
 		var bodyReader io.Reader = resp.Body
 		ce := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
 		isGzip := ce == "gzip"
 		isDeflate := ce == "deflate"
+		// compressedDeflate holds the raw compressed bytes for deflate responses so
+		// we can restore the body if the decompressed size exceeds the rewrite limit.
+		var compressedDeflate []byte
 		if !isGzip && !isDeflate && ce != "" && ce != "identity" {
 			// Unknown encoding (br, zstd, …) — forward body unchanged and skip rewriting.
 			logger.Printf("maskproxy: skipping body rewrite: unsupported Content-Encoding %q", ce)
@@ -1418,22 +1419,30 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			// HTTP "deflate" is ambiguous: some servers send zlib-wrapped DEFLATE
 			// (RFC 1950), others send raw DEFLATE (RFC 1951). Try zlib first; if
 			// the header bytes don't match (0x78 magic), fall back to raw flate.
-			// Buffer the body so we can re-read on fallback.
-			compressed, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+			// Buffer the compressed bytes first so we can restore on fallback or
+			// when the decompressed size exceeds the rewrite limit.
+			var err error
+			compressedDeflate, err = io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
 			if err != nil {
 				return err
 			}
+			// If the compressed body alone exceeds the limit, forward it unchanged.
+			if int64(len(compressedDeflate)) > maxBodyBytes {
+				logger.Printf("maskproxy: deflate body exceeds %d bytes; skipping rewrite", maxBodyBytes)
+				resp.Body = io.NopCloser(bytes.NewReader(compressedDeflate))
+				logger.LogResponse(resp, "", start, 0)
+				return nil
+			}
 			var dr io.ReadCloser
-			if len(compressed) >= 2 && compressed[0] == 0x78 {
-				dr, err = zlib.NewReader(bytes.NewReader(compressed))
+			if len(compressedDeflate) >= 2 && compressedDeflate[0] == 0x78 {
+				dr, err = zlib.NewReader(bytes.NewReader(compressedDeflate))
 			} else {
-				dr = flate.NewReader(bytes.NewReader(compressed))
+				dr = flate.NewReader(bytes.NewReader(compressedDeflate))
 				err = nil
 			}
 			if err != nil {
 				logger.Printf("maskproxy: failed to decode deflate response: %v", err)
-				// Restore original body and skip rewriting.
-				resp.Body = io.NopCloser(bytes.NewReader(compressed))
+				resp.Body = io.NopCloser(bytes.NewReader(compressedDeflate))
 				logger.LogResponse(resp, "", start, 0)
 				return nil
 			}
@@ -1448,16 +1457,19 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		}
 
 		// If the body exceeded the limit, forward it unchanged to avoid data loss.
-		// For non-gzip bodies bodyReader IS resp.Body, so we stitch the already-read
-		// prefix back together with the remaining stream via io.MultiReader.
-		// For gzip, the compressed stream is already partially consumed and cannot
-		// be reconstructed; we forward the decompressed portion and log a warning.
+		// - plain identity: stitch prefix back with the remaining stream via io.MultiReader
+		// - gzip: compressed stream is consumed; forward the decompressed prefix (Content-Encoding already stripped)
+		// - deflate: restore original compressed bytes and Content-Encoding header
 		if int64(len(raw)) > maxBodyBytes {
 			logger.Printf("maskproxy: response body exceeds %d bytes; skipping rewrite", maxBodyBytes)
 			logger.LogResponse(resp, "", start, 0)
-			if isGzip {
+			switch {
+			case isDeflate:
+				resp.Header.Set("Content-Encoding", "deflate")
+				resp.Body = io.NopCloser(bytes.NewReader(compressedDeflate))
+			case isGzip:
 				resp.Body = io.NopCloser(bytes.NewReader(raw))
-			} else {
+			default:
 				resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(raw), resp.Body))
 			}
 			return nil
