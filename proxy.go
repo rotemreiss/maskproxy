@@ -121,6 +121,7 @@ var headersStrip = map[string]bool{
 var textContentTypes = []string{
 	"text/",
 	"application/json",
+	"application/manifest+json", // PWA web app manifests (start_url, icons, etc.)
 	"application/xml",
 	"application/xhtml",
 	"application/javascript",
@@ -128,6 +129,9 @@ var textContentTypes = []string{
 	"application/x-javascript",
 	"application/ld+json",
 	"application/graphql",
+	"application/feed+json", // JSON Feed
+	"application/rss+xml",
+	"application/atom+xml",
 }
 
 // withExternalURLsProtected applies fn to s while shielding any absolute URLs

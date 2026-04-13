@@ -45,6 +45,9 @@ func TestIsTextContent(t *testing.T) {
 		// Application text-like types — must be rewritten.
 		{"application/json", true},
 		{"application/json; charset=utf-8", true},
+		{"application/manifest+json", true},       // PWA web app manifests
+		{"application/manifest+json; charset=utf-8", true},
+		{"application/feed+json", true},            // JSON Feed
 		{"application/xml", true},
 		{"application/xhtml+xml", true},
 		{"application/javascript", true},
@@ -52,6 +55,8 @@ func TestIsTextContent(t *testing.T) {
 		{"application/ld+json", true},
 		{"application/graphql", true},
 		{"application/x-www-form-urlencoded", true},
+		{"application/rss+xml", true},
+		{"application/atom+xml", true},
 
 		// Binary types — must NOT be rewritten.
 		{"image/png", false},
