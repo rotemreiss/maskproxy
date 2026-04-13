@@ -12,6 +12,11 @@ import (
 	"testing"
 )
 
+// testLogger returns a silent Logger suitable for unit tests (no output, no file).
+func testLogger() *Logger {
+	return newDiscardLogger()
+}
+
 // ---- Replacer unit tests ----
 
 func TestReplacerEmpty(t *testing.T) {
@@ -95,7 +100,7 @@ func newProxy(t *testing.T, upstream *httptest.Server, replaceSpec string) *http
 	if err != nil {
 		t.Fatalf("NewReplacer: %v", err)
 	}
-	proxy := NewReverseProxy(host, "http", rep, false, "", true)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, testLogger())
 	return httptest.NewServer(proxy)
 }
 
@@ -130,7 +135,7 @@ func TestProxyRequestURLReplacement(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme,ctfd:foo", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "", true)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, testLogger())
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -175,7 +180,7 @@ func TestProxyBinaryNotRewritten(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "", true)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, testLogger())
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -230,7 +235,7 @@ func TestProxyLargeBodySkipsRewrite(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme", false) // no matches in body, but rewrite path is triggered
-	proxy := NewReverseProxy(host, "http", rep, false, "", true)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, testLogger())
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -293,7 +298,7 @@ func TestProxyHostMasking(t *testing.T) {
 	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false) // no user replacements; masking alone is under test
 	const fakeProxyAddr = "masked.proxy:9999"
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, fakeProxyAddr, true)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, fakeProxyAddr, true, testLogger())
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -347,7 +352,7 @@ func TestProxyHostMaskingWithUserReplacements(t *testing.T) {
 	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme,ctfd:foo", false)
 	const fakeProxyAddr = "masked.proxy:9999"
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, fakeProxyAddr, true)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, fakeProxyAddr, true, testLogger())
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -392,7 +397,7 @@ func TestProxySetCookieRewrite(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, testLogger())
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
