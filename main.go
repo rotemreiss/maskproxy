@@ -317,6 +317,7 @@ func parseHeaders(raw []string) ([]headerPair, error) {
 }
 
 
+// loadReplaceFile reads a replacement-pairs file and returns a comma-separated
 // spec string suitable for NewReplacer.
 //
 // File format (one pair per line):

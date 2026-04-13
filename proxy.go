@@ -663,19 +663,21 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			reqTimes.Store(req, start)
 		}
 
-		// Limit accepted encodings to what we can transparently decompress.
-		// Other encodings (brotli, zstd) that Go stdlib cannot decode natively
-		// would reach ModifyResponse compressed and corrupt after string replacement.
-		req.Header.Del("Accept-Encoding")
-		req.Header.Add("Accept-Encoding", "gzip, identity")
-
 		// Inject user-defined extra headers (from -header flags).  Use Set so
 		// that if the client also sent the same header, our value wins.  This
-		// runs after all other header rewrites so these values are sent as-is
-		// to the upstream (no alias→original substitution applied to them).
+		// runs BEFORE the Accept-Encoding override below so that a user-supplied
+		// -header "Accept-Encoding: ..." cannot silently bypass the proxy's
+		// gzip-only enforcement (which is needed for correct body rewriting).
 		for _, h := range extraHeaders {
 			req.Header.Set(h.name, h.value)
 		}
+
+		// Limit accepted encodings to what we can transparently decompress.
+		// Other encodings (brotli, zstd) that Go stdlib cannot decode natively
+		// would reach ModifyResponse compressed and corrupt after string replacement.
+		// This runs AFTER extraHeaders so our enforcement always wins.
+		req.Header.Del("Accept-Encoding")
+		req.Header.Add("Accept-Encoding", "gzip, identity")
 
 		// Strip client-supplied X-Forwarded-For to prevent header injection.
 		req.Header.Del("X-Forwarded-For")
