@@ -3099,3 +3099,62 @@ func TestBaseHrefSubdomainRewrite(t *testing.T) {
 		})
 	}
 }
+
+// TestSpeculationRulesStripped verifies that the Speculation-Rules and
+// Document-Policy response headers are stripped unconditionally.
+func TestSpeculationRulesStripped(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Speculation-Rules", "/speculation-rules.json")
+		w.Header().Set("Document-Policy", "document-write=?0")
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html><body>page</body></html>")
+	}))
+	defer upstream.Close()
+	mainHost := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(mainHost, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+	resp, err := http.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if v := resp.Header.Get("Speculation-Rules"); v != "" {
+		t.Errorf("Speculation-Rules not stripped: %q", v)
+	}
+	if v := resp.Header.Get("Document-Policy"); v != "" {
+		t.Errorf("Document-Policy not stripped: %q", v)
+	}
+}
+
+// TestManifestScopeSubdomainRewrite verifies that scope and start_url in a
+// PWA manifest served from a subdomain page are prefixed with /__sd__/<host>/.
+func TestManifestScopeSubdomainRewrite(t *testing.T) {
+	const subHost = "app.example.com"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/manifest+json")
+		fmt.Fprint(w, `{"name":"App","scope":"/","start_url":"/app/","display":"standalone"}`)
+	}))
+	defer upstream.Close()
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy("example.com", "http", rep, false, "localhost:9050", false, 0, testLogger(), nil, nil, 0)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+	req, _ := http.NewRequest("GET", ps.URL+"/__sd__/"+subHost+"/manifest.json", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	bodyStr := string(body)
+	sdPfx := "/__sd__/" + subHost
+	if !strings.Contains(bodyStr, `"scope":"`+sdPfx+`/"`) {
+		t.Errorf("scope not rewritten; got: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `"start_url":"`+sdPfx+`/app/"`) {
+		t.Errorf("start_url not rewritten; got: %s", bodyStr)
+	}
+}

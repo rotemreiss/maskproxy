@@ -99,6 +99,13 @@ var metaRefreshRe = regexp.MustCompile(`(?i)(content\s*=\s*["'][0-9]+\s*;\s*url=
 // Group 3 = the closing quote.
 var baseHrefRe = regexp.MustCompile(`(?i)(<base[^>]+\bhref\s*=\s*)(["'])([^"']*)(["'])`)
 
+// manifestRootRelativeRe matches JSON string values for "scope" and "start_url"
+// keys in a PWA manifest that are root-relative paths.  Used to prefix them with
+// the /__sd__/<host> proxy route so PWA scoping resolves correctly.
+// Group 1 = the key+colon+space prefix (e.g. `"scope":`).
+// Group 2 = the root-relative path value (e.g. `/`).
+var manifestRootRelativeRe = regexp.MustCompile(`("(?:scope|start_url)"\s*:\s*)"(/[^"]*)"`)
+
 // linkHeaderRe matches root-relative URLs inside Link header angle brackets.
 // Format: `</path/to/resource>; rel=preload`
 // Group 1 = the root-relative path (the part between < and >).
@@ -321,6 +328,22 @@ var headersStrip = map[string]bool{
 	// a separate agent cluster which may prevent certain cross-window
 	// interactions needed when multiple proxied pages interoperate.  Strip it.
 	"Origin-Agent-Cluster": true,
+
+	// Speculation-Rules: a Chrome 109+ header whose value is a URL pointing to a
+	// JSON file that lists pages to prefetch/prerender.  If forwarded, Chrome
+	// would make those speculative requests directly to the upstream host
+	// (bypassing the proxy) or to paths on the proxy that resolve to the wrong
+	// upstream host.  Strip the header so speculative loads don't escape.
+	// Note: <script type="speculationrules"> elements in the body are still
+	// processed by maskResponseString / rewriteRootRelativePaths like any other
+	// JS/HTML content, so inline speculation rules are handled correctly.
+	"Speculation-Rules": true,
+
+	// Document-Policy: a newer header (like Permissions-Policy) that restricts
+	// document behaviour (e.g. no-document-write, sync-xhr=?0).  Since all proxied
+	// sites share localhost:PORT, a restrictive policy from one site would apply
+	// globally to every other proxied site on the same origin.  Strip it.
+	"Document-Policy": true,
 }
 
 // textContentTypes lists MIME type prefixes for which body replacement is safe.
@@ -1977,6 +2000,33 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 
 			rewritten = headTagRe.ReplaceAllStringFunc(rewritten, func(tag string) string {
 				return tag + script
+			})
+		}
+
+		// Pass 2c: for subdomain PWA manifest (application/manifest+json) responses,
+		// rewrite root-relative "scope" and "start_url" JSON string values so the
+		// PWA is scoped to the subdomain proxy route, not the proxy root.
+		// maskResponseString already handles absolute URLs in the manifest body;
+		// this pass handles the root-relative form ("/" or "/app/") that
+		// maskResponseString intentionally skips (to avoid corrupting non-URL strings).
+		//
+		// JSON string values matching root-relative paths are prefixed with
+		// "/__sd__/<host>" so the browser navigates within the correct proxy route.
+		if isSubdomain && strings.Contains(contentType, "manifest+json") {
+			sdPfx := subdomainPrefix + reqHost
+			// Match JSON string values that are root-relative paths.
+			// e.g.: "scope": "/" → "scope": "/__sd__/host.com/"
+			//       "start_url": "/app/" → "start_url": "/__sd__/host.com/app/"
+			rewritten = manifestRootRelativeRe.ReplaceAllStringFunc(rewritten, func(m string) string {
+				sub := manifestRootRelativeRe.FindStringSubmatch(m)
+				if len(sub) < 3 {
+					return m
+				}
+				key, path := sub[1], sub[2]
+				if strings.HasPrefix(path, subdomainPrefix) {
+					return m
+				}
+				return key + `"` + sdPfx + path + `"`
 			})
 		}
 
