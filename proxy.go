@@ -199,6 +199,13 @@ func isTextContent(contentType string) bool {
 //   - Domain attribute: cleared so the browser scopes the cookie to whatever
 //     host it actually sees (the proxy), not the upstream hostname.
 //
+//   - Path attribute: prefixed with /__sd__/<subHost> when the response came
+//     from a subdomain route.  Browsers match cookies by path; without this
+//     a cookie with Path=/api/ set by "/__sd__/sub.host.com/api/" would never
+//     be sent back because the browser path-matches against the proxy's URL
+//     (/__sd__/sub.host.com/api/), not the upstream path (/api/).
+//     When subHost is empty (main target response) the Path is left unchanged.
+//
 //   - Secure flag: removed when the proxy listens on plain HTTP.  Browsers
 //     refuse to send Secure cookies over non-HTTPS connections, which would
 //     silently break any session-based flow.
@@ -209,7 +216,7 @@ func isTextContent(contentType string) bool {
 //
 // This must run unconditionally — every response can carry Set-Cookie, not
 // just text responses.
-func rewriteSetCookies(resp *http.Response, proxyIsHTTPS bool) {
+func rewriteSetCookies(resp *http.Response, proxyIsHTTPS bool, subHost string) {
 	cookies := resp.Cookies()
 	if len(cookies) == 0 {
 		return
@@ -219,6 +226,16 @@ func rewriteSetCookies(resp *http.Response, proxyIsHTTPS bool) {
 	for _, c := range cookies {
 		// Clear Domain: let the browser default to the serving host (the proxy).
 		c.Domain = ""
+		// Prefix Path with /__sd__/<subHost> for subdomain-routed responses so
+		// the browser path-matches against the proxy URL, not the upstream path.
+		if subHost != "" {
+			pfx := subdomainPrefix + subHost // e.g. "/__sd__/sub.example.com"
+			if c.Path == "" || c.Path == "/" {
+				c.Path = pfx + "/"
+			} else {
+				c.Path = pfx + c.Path
+			}
+		}
 		if !proxyIsHTTPS {
 			c.Secure = false
 			// SameSite=None without Secure is rejected by browsers; downgrade.
@@ -1218,8 +1235,14 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// leak the upstream hostname.  These must be rewritten unconditionally
 		// regardless of Content-Type so the browser never escapes the proxy.
 
-		// Set-Cookie: clear Domain, remove Secure/SameSite=None for plain-HTTP.
-		rewriteSetCookies(resp, false /* proxy listens on plain HTTP */)
+		// Set-Cookie: clear Domain, fix Path for subdomain routes, remove Secure/SameSite=None.
+		// subHost is non-empty only when the response came from a subdomain route
+		// (/__sd__/<host>/...) so that cookie Paths are prefixed correctly.
+		var cookieSubHost string
+		if rh := resp.Request.URL.Host; !strings.EqualFold(rh, targetHost) && rh != "" {
+			cookieSubHost = rh
+		}
+		rewriteSetCookies(resp, false /* proxy listens on plain HTTP */, cookieSubHost)
 
 		// Strip headers that are tied to the upstream origin and would break
 		// the proxy (HSTS, key pinning).  Runs unconditionally — even for ignored

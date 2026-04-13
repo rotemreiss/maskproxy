@@ -219,7 +219,7 @@ func TestRewriteSetCookiesUnit(t *testing.T) {
 	t.Run("domain cleared, secure stripped", func(t *testing.T) {
 		resp := &http.Response{Header: http.Header{}}
 		resp.Header.Add("Set-Cookie", "session=abc; Domain=ctf.io; Secure; HttpOnly; Path=/")
-		rewriteSetCookies(resp, false)
+		rewriteSetCookies(resp, false, "")
 		sc := resp.Header.Get("Set-Cookie")
 		if strings.Contains(sc, "Domain=") {
 			t.Errorf("Domain not removed: %q", sc)
@@ -235,7 +235,7 @@ func TestRewriteSetCookiesUnit(t *testing.T) {
 	t.Run("SameSite=None downgraded to Lax when plain HTTP", func(t *testing.T) {
 		resp := &http.Response{Header: http.Header{}}
 		resp.Header.Add("Set-Cookie", "pref=dark; SameSite=None; Secure")
-		rewriteSetCookies(resp, false)
+		rewriteSetCookies(resp, false, "")
 		sc := resp.Header.Get("Set-Cookie")
 		if strings.Contains(sc, "SameSite=None") {
 			t.Errorf("SameSite=None not downgraded: %q", sc)
@@ -248,7 +248,7 @@ func TestRewriteSetCookiesUnit(t *testing.T) {
 	t.Run("SameSite=None kept when proxy is HTTPS", func(t *testing.T) {
 		resp := &http.Response{Header: http.Header{}}
 		resp.Header.Add("Set-Cookie", "pref=dark; SameSite=None; Secure")
-		rewriteSetCookies(resp, true) // proxy is HTTPS
+		rewriteSetCookies(resp, true, "") // proxy is HTTPS
 		sc := resp.Header.Get("Set-Cookie")
 		if !strings.Contains(sc, "SameSite=None") {
 			t.Errorf("SameSite=None incorrectly removed when proxy is HTTPS: %q", sc)
@@ -261,7 +261,7 @@ func TestRewriteSetCookiesUnit(t *testing.T) {
 	t.Run("plain cookie unchanged", func(t *testing.T) {
 		resp := &http.Response{Header: http.Header{}}
 		resp.Header.Add("Set-Cookie", "token=xyz; Path=/; HttpOnly")
-		rewriteSetCookies(resp, false)
+		rewriteSetCookies(resp, false, "")
 		sc := resp.Header.Get("Set-Cookie")
 		if !strings.Contains(sc, "token=xyz") {
 			t.Errorf("plain cookie value corrupted: %q", sc)
@@ -270,14 +270,14 @@ func TestRewriteSetCookiesUnit(t *testing.T) {
 
 	t.Run("no Set-Cookie headers is a no-op", func(t *testing.T) {
 		resp := &http.Response{Header: http.Header{}}
-		rewriteSetCookies(resp, false) // must not panic
+		rewriteSetCookies(resp, false, "") // must not panic
 	})
 
 	t.Run("multiple cookies all rewritten", func(t *testing.T) {
 		resp := &http.Response{Header: http.Header{}}
 		resp.Header.Add("Set-Cookie", "a=1; Domain=example.com; Secure")
 		resp.Header.Add("Set-Cookie", "b=2; Domain=example.com; Secure")
-		rewriteSetCookies(resp, false)
+		rewriteSetCookies(resp, false, "")
 		cookies := resp.Header.Values("Set-Cookie")
 		if len(cookies) != 2 {
 			t.Fatalf("expected 2 cookies, got %d", len(cookies))
@@ -289,6 +289,36 @@ func TestRewriteSetCookiesUnit(t *testing.T) {
 			if strings.Contains(strings.ToLower(sc), "secure") {
 				t.Errorf("Secure not cleared: %q", sc)
 			}
+		}
+	})
+
+	t.Run("subdomain Path prefixed with __sd__ route", func(t *testing.T) {
+		resp := &http.Response{Header: http.Header{}}
+		resp.Header.Add("Set-Cookie", "sess=tok; Path=/api/; HttpOnly")
+		rewriteSetCookies(resp, false, "sub.example.com")
+		sc := resp.Header.Get("Set-Cookie")
+		if !strings.Contains(sc, "Path=/__sd__/sub.example.com/api/") {
+			t.Errorf("subdomain cookie Path not prefixed: %q", sc)
+		}
+	})
+
+	t.Run("subdomain root Path becomes __sd__ prefix", func(t *testing.T) {
+		resp := &http.Response{Header: http.Header{}}
+		resp.Header.Add("Set-Cookie", "sid=1; Path=/")
+		rewriteSetCookies(resp, false, "api.example.com")
+		sc := resp.Header.Get("Set-Cookie")
+		if !strings.Contains(sc, "Path=/__sd__/api.example.com/") {
+			t.Errorf("root Path not rewritten for subdomain: %q", sc)
+		}
+	})
+
+	t.Run("main target cookies path unchanged", func(t *testing.T) {
+		resp := &http.Response{Header: http.Header{}}
+		resp.Header.Add("Set-Cookie", "sid=1; Path=/app/")
+		rewriteSetCookies(resp, false, "") // subHost="" = main target
+		sc := resp.Header.Get("Set-Cookie")
+		if !strings.Contains(sc, "Path=/app/") || strings.Contains(sc, "/__sd__/") {
+			t.Errorf("main target cookie Path incorrectly modified: %q", sc)
 		}
 	})
 }
