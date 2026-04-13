@@ -361,7 +361,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if insecure {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // intentional for CTF
-		log.Printf("ctfproxy: WARNING — TLS certificate verification disabled (-insecure)")
+		log.Printf("maskproxy: WARNING — TLS certificate verification disabled (-skip-verify)")
 	}
 
 	director := func(req *http.Request) {

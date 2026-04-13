@@ -9,41 +9,46 @@ import (
 	"strings"
 )
 
-const usage = `ctfproxy — a transparent rewriting reverse proxy
+const usage = `maskproxy — a transparent rewriting reverse proxy
 
 Usage:
-  ctfproxy -target <host> [options]
+  maskproxy -target <host> [options]
 
 Options:
-  -target   <host>         Upstream host to proxy traffic to (required).
-                           Do NOT include a scheme — use -ssl to choose https.
-  -replace  <pairs>        Comma-separated list of original:alias pairs.
-                           Aliases are used by the client; originals are sent
-                           to the upstream server.
-                           Example: ctf:acme,ctfd:foo
-  -ssl                     Use HTTPS when connecting to the upstream target.
-  -insecure                Skip TLS certificate verification for the upstream.
-                           Use this when the target has a self-signed certificate.
-  -ci                      Case-insensitive string replacement.
-                           Matches "Microsoft", "MICROSOFT", "microsoft", etc.
-  -exact-domain            Only mask the exact target host.
-                           By default ctfproxy also masks every subdomain of the
-                           target's root domain (api.*, cdn.*, auth.*, …) so
-                           no subdomain leaks to the client.  Use -exact-domain
-                           to restrict masking to the literal -target host only.
-  -port     <n>            Local port to listen on (default: 8080).
-  -listen   <addr>         Local listen address (default: 0.0.0.0).
-                           Use "127.0.0.1" to restrict to loopback only.
+  -target      <host>    Upstream host to proxy traffic to (required).
+                         Do NOT include a scheme — HTTPS is used by default.
+                         Use -insecure to connect over plain HTTP instead.
+  -replace     <pairs>   Comma-separated list of original:alias pairs.
+                         Aliases are used by the client; originals are sent
+                         to the upstream server.
+                         Example: ctf:acme,ctfd:foo
+  -insecure              Connect to the upstream over plain HTTP (no TLS).
+                         Default is HTTPS.
+  -skip-verify           Skip TLS certificate verification for the upstream.
+                         Use this when the target has a self-signed certificate.
+  -ci                    Case-insensitive string replacement.
+                         Matches "Microsoft", "MICROSOFT", "microsoft", etc.
+  -exact-domain          Only mask the exact target host.
+                         By default maskproxy also masks every subdomain of the
+                         target's root domain (api.*, cdn.*, auth.*, …) so
+                         no subdomain leaks to the client.  Use -exact-domain
+                         to restrict masking to the literal -target host only.
+  -port        <n>       Local port to listen on (default: 8080).
+  -listen      <addr>    Local listen address (default: 0.0.0.0).
+                         Use "127.0.0.1" to restrict to loopback only.
 
 Examples:
   # Proxy localhost:8080 → https://ctf.io, rewriting ctf↔acme and ctfd↔foo
-  ctfproxy -target ctf.io -replace ctf:acme,ctfd:foo -ssl
+  maskproxy -target ctf.io -replace ctf:acme,ctfd:foo
 
-  # Same but allow a self-signed TLS certificate on the upstream
-  ctfproxy -target ctf.io -replace ctf:acme,ctfd:foo -ssl -insecure
+  # Same but skip TLS certificate verification (self-signed cert)
+  maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -skip-verify
 
-  # Same but listen only on loopback, port 9090
-  ctfproxy -target ctf.io -replace ctf:acme,ctfd:foo -ssl -port 9090 -listen 127.0.0.1
+  # Connect to an HTTP-only upstream
+  maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -insecure
+
+  # Listen only on loopback, port 9090
+  maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -port 9090 -listen 127.0.0.1
 
 Replacement behaviour:
   Outbound requests  (client → upstream): aliases  are rewritten to originals.
@@ -56,8 +61,8 @@ Replacement behaviour:
 func main() {
 	target := flag.String("target", "", "Upstream host (required, no scheme)")
 	replace := flag.String("replace", "", "Comma-separated original:alias pairs, e.g. ctf:acme,ctfd:foo")
-	ssl := flag.Bool("ssl", false, "Use HTTPS for the upstream target")
-	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification (for self-signed certs)")
+	insecure := flag.Bool("insecure", false, "Use plain HTTP for the upstream (no TLS)")
+	skipVerify := flag.Bool("skip-verify", false, "Skip TLS certificate verification (for self-signed certs)")
 	ci := flag.Bool("ci", false, "Case-insensitive string replacement (e.g. matches 'Microsoft' and 'MICROSOFT')")
 	exactDomain := flag.Bool("exact-domain", false, "Only mask the exact target host, not subdomains")
 	port := flag.Int("port", 8080, "Local port to listen on")
@@ -74,7 +79,7 @@ func main() {
 	}
 
 	// Strip any scheme the user may have accidentally included (e.g. "https://ctf.io").
-	// The scheme is controlled exclusively by the -ssl flag.
+	// The scheme is controlled exclusively by the -insecure flag.
 	if i := strings.Index(*target, "://"); i >= 0 {
 		stripped := (*target)[i+3:]
 		fmt.Fprintf(os.Stderr, "warning: scheme stripped from -target; using %q\n", stripped)
@@ -91,15 +96,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	scheme := "http"
-	if *ssl {
-		scheme = "https"
+	scheme := "https"
+	if *insecure {
+		scheme = "http"
 	}
 
-	proxy := NewReverseProxy(*target, scheme, rep, *insecure, proxyAddr(scheme, *listen, *port), *exactDomain)
+	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, proxyAddr(scheme, *listen, *port), *exactDomain)
 
 	addr := fmt.Sprintf("%s:%d", *listen, *port)
-	log.Printf("ctfproxy listening on http://%s", addr)
+	log.Printf("maskproxy listening on http://%s", addr)
 	log.Printf("  → upstream: %s://%s", scheme, *target)
 	if rep.HasPairs() {
 		log.Printf("  → replacements: %s", *replace)
@@ -114,7 +119,7 @@ func main() {
 	}
 
 	if err := http.ListenAndServe(addr, proxy); err != nil {
-		log.Fatalf("ctfproxy: %v", err)
+		log.Fatalf("maskproxy: %v", err)
 	}
 }
 

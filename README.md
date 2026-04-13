@@ -25,20 +25,30 @@ go build -o maskproxy .
 ## Usage
 
 ```
-ctfproxy -target <host> [options]
+maskproxy -target <host> [options]
 
 Options:
-  -target  <host>   Upstream host (required, no scheme)
-  -replace <pairs>  Comma-separated original:alias pairs (e.g. ctf:acme,ctfd:foo)
-  -ssl              Use HTTPS for the upstream target
-  -port    <n>      Local port (default: 8080)
-  -listen  <addr>   Local bind address (default: 0.0.0.0)
+  -target      <host>   Upstream host (required, no scheme — HTTPS by default)
+  -replace     <pairs>  Comma-separated original:alias pairs (e.g. ctf:acme,ctfd:foo)
+  -insecure             Connect to upstream over plain HTTP instead of HTTPS
+  -skip-verify          Skip TLS certificate verification (self-signed certs)
+  -ci                   Case-insensitive string replacement
+  -exact-domain         Only mask the exact target host, not subdomains
+  -port        <n>      Local port (default: 8080)
+  -listen      <addr>   Local bind address (default: 0.0.0.0)
 ```
 
 ## Example
 
 ```bash
-./ctfproxy -target ctf.io -replace ctf:acme,ctfd:foo -ssl
+# HTTPS upstream (default)
+maskproxy -target ctf.io -replace ctf:acme,ctfd:foo
+
+# Self-signed certificate
+maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -skip-verify
+
+# Plain HTTP upstream
+maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -insecure
 ```
 
 | Direction | What happens |
