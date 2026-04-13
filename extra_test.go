@@ -878,8 +878,78 @@ func TestProxyXForwardedForStripped(t *testing.T) {
 	}
 }
 
-// TestEffectiveProxyAddrContextPropagation verifies that when a client accesses
-// the proxy via 127.0.0.1:PORT, redirect Location headers in the response are
+// TestConditionalRequestHeadersStripped verifies that If-None-Match and
+// If-Modified-Since are stripped before reaching the upstream.  If forwarded,
+// a 304 Not Modified response would skip body rewriting and leave the browser
+// with a stale cached copy containing unrewritten upstream hostnames.
+func TestConditionalRequestHeadersStripped(t *testing.T) {
+	var capturedIfNoneMatch, capturedIfModifiedSince string
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedIfNoneMatch = r.Header.Get("If-None-Match")
+		capturedIfModifiedSince = r.Header.Get("If-Modified-Since")
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ps.URL+"/page", nil)
+	req.Header.Set("If-None-Match", `"abc123"`)
+	req.Header.Set("If-Modified-Since", "Wed, 01 Jan 2020 00:00:00 GMT")
+	resp, err := ps.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if capturedIfNoneMatch != "" {
+		t.Errorf("If-None-Match was forwarded upstream: %q", capturedIfNoneMatch)
+	}
+	if capturedIfModifiedSince != "" {
+		t.Errorf("If-Modified-Since was forwarded upstream: %q", capturedIfModifiedSince)
+	}
+}
+
+// TestETagLastModifiedStripped verifies that ETag and Last-Modified response
+// headers are removed by the proxy.  If left in place, the browser would cache
+// these and send conditional requests on re-visits; a 304 response would then
+// bypass body rewriting entirely.
+func TestETagLastModifiedStripped(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"strongetag123"`)
+		w.Header().Set("Last-Modified", "Wed, 01 Jan 2020 00:00:00 GMT")
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := http.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if v := resp.Header.Get("ETag"); v != "" {
+		t.Errorf("ETag should be stripped, got %q", v)
+	}
+	if v := resp.Header.Get("Last-Modified"); v != "" {
+		t.Errorf("Last-Modified should be stripped, got %q", v)
+	}
+}
+
+
 // also written with 127.0.0.1:PORT (not localhost:PORT), preventing CORS errors.
 func TestEffectiveProxyAddrContextPropagation(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

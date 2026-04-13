@@ -144,6 +144,15 @@ var headersStrip = map[string]bool{
 	// Cross-Origin-Resource-Policy: same-origin would block the proxy from
 	// forwarding cross-origin subresources (images, fonts, etc.).
 	"Cross-Origin-Resource-Policy": true,
+
+	// ETag and Last-Modified enable conditional requests (If-None-Match /
+	// If-Modified-Since).  If the browser cached a previous proxy response and
+	// later sends a conditional GET, the upstream would return 304 Not Modified,
+	// causing ModifyResponse to skip body rewriting — the browser then uses its
+	// stale cached copy that may contain unrewritten hostnames.  Strip these
+	// validators so the browser never makes conditional requests for proxied pages.
+	"Etag":          true,
+	"Last-Modified": true,
 }
 
 // textContentTypes lists MIME type prefixes for which body replacement is safe.
@@ -1236,6 +1245,17 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 
 		// Strip client-supplied X-Forwarded-For to prevent header injection.
 		req.Header.Del("X-Forwarded-For")
+
+		// Strip conditional-request headers sent by the browser so the upstream
+		// always returns the full response body.  If we forwarded these and got
+		// a 304 Not Modified, ModifyResponse would skip body rewriting (noBody
+		// path) and the browser would use a cached copy that may contain
+		// unrewritten upstream hostnames or old string-replacement results.
+		req.Header.Del("If-None-Match")
+		req.Header.Del("If-Modified-Since")
+		req.Header.Del("If-Match")
+		req.Header.Del("If-Unmodified-Since")
+		req.Header.Del("If-Range")
 	}
 
 	modifyResponse := func(resp *http.Response) error {
