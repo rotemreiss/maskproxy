@@ -1192,6 +1192,16 @@ name: "token with port and path rewritten",
 in:   "connect-src https://api.microsoft.com:8443/v2/*",
 want: "connect-src http://localhost:9001",
 },
+{
+name: "ws scheme (plain WS) becomes ws://proxy",
+in:   "connect-src ws://microsoft.com",
+want: "connect-src ws://localhost:9001",
+},
+{
+name: "trailing semicolon produces no empty directive",
+in:   "default-src 'self'; script-src https://microsoft.com;",
+want: "default-src 'self'; script-src http://localhost:9001",
+},
 }
 
 for _, tc := range cases {

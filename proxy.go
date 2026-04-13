@@ -621,9 +621,9 @@ func rewriteCSPToken(token, targetLower, rootLower, proxyAddr string) string {
 		return token
 	}
 
-	// Map scheme: wss → ws (proxy is plain HTTP); everything else → http.
+	// Map scheme: wss → ws (proxy is plain HTTP); ws → ws; everything else → http.
 	switch scheme {
-	case "wss://":
+	case "wss://", "ws://":
 		return "ws://" + proxyAddr
 	case "", "https://", "http://":
 		if scheme == "" {
