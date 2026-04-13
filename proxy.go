@@ -592,6 +592,20 @@ func rewriteCSPToken(token, targetLower, rootLower, proxyAddr string) string {
 	}
 }
 
+// isIgnoredHost reports whether host (with or without port) is in the
+// ignoredHosts set.  The set keys are already lowercased at parse time.
+// A nil or empty set always returns false — no ignored hosts configured.
+func isIgnoredHost(host string, ignoredHosts map[string]bool) bool {
+	if len(ignoredHosts) == 0 {
+		return false
+	}
+	// Strip port if present (e.g. "login.microsoftonline.com:443" → "login.microsoftonline.com").
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return ignoredHosts[strings.ToLower(host)]
+}
+
 // unmaskRequestString is the reverse of maskResponseString: it rewrites s from
 // an outbound request so that proxy-address references become the upstream host.
 // This MUST run after user-supplied replacements (which convert aliases to
@@ -800,7 +814,7 @@ func (c *wsLoggingConn) Close() error { return c.rwc.Close() }
 //
 // logger handles all per-request and startup logging; pass a Logger constructed
 // with NewLogger.
-func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger, extraHeaders []headerPair) *httputil.ReverseProxy {
+func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger, extraHeaders []headerPair, ignoredHosts map[string]bool) *httputil.ReverseProxy {
 	target := &url.URL{Scheme: scheme, Host: targetHost}
 
 	// Build a single regex that matches the scheme+host prefix of any subdomain
@@ -904,7 +918,22 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		req.Host = targetHost
 
 		// Rewrite URL path and query: client aliases → server originals.
-		if rep.HasPairs() {
+		// Skipped when the destination is an ignored host.
+		//
+		// For subdomain requests (/__sd__/<host>/...) we can determine the
+		// outbound host by peeking at the path before extraction, so we can
+		// correctly suppress path/query rewriting for ignored subdomain hosts
+		// without restructuring the entire director.
+		outboundHostForPath := req.Host // default: main target
+		if strings.HasPrefix(req.URL.Path, subdomainPrefix) {
+			rest := req.URL.Path[len(subdomainPrefix):]
+			if i := strings.Index(rest, "/"); i >= 0 {
+				outboundHostForPath = rest[:i]
+			} else {
+				outboundHostForPath = rest
+			}
+		}
+		if rep.HasPairs() && !isIgnoredHost(outboundHostForPath, ignoredHosts) {
 			req.URL.Path = rep.ToOriginal(req.URL.Path)
 			if req.URL.RawPath != "" {
 				req.URL.RawPath = rep.ToOriginal(req.URL.RawPath)
@@ -963,28 +992,37 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// upstream hostname so Referer and Origin headers are rewritten correctly.
 		// Order matters: user replacements first so the reverse-mask step sees
 		// fully-original values when looking for the proxy address.
+		//
+		// Both rewrites are skipped for ignored hosts — their requests must flow
+		// through unchanged so that functional strings (OAuth scopes, tenant IDs,
+		// etc.) are not corrupted by the user-defined replacement pairs.
 		outboundHost := req.Host
-		for key, vals := range req.Header {
-			for i, v := range vals {
-				if rep.HasPairs() {
-					v = rep.ToOriginal(v)
+		if !isIgnoredHost(outboundHost, ignoredHosts) {
+			for key, vals := range req.Header {
+				for i, v := range vals {
+					if rep.HasPairs() {
+						v = rep.ToOriginal(v)
+					}
+					v = unmaskRequestString(v, outboundHost, scheme, proxyAddr)
+					req.Header[key][i] = v
 				}
-				v = unmaskRequestString(v, outboundHost, scheme, proxyAddr)
-				req.Header[key][i] = v
 			}
 		}
 
 		// Same two-pass rewrite for the request body (e.g. form POST, JSON).
+		// Also skipped for ignored hosts.
 		if req.Body != nil {
 			body, err := io.ReadAll(req.Body)
 			req.Body.Close()
 			if err == nil {
 				rewritten := string(body)
 				replaceCount := 0
-				if rep.HasPairs() {
-					rewritten, replaceCount = rep.ToOriginalDiff(rewritten)
+				if !isIgnoredHost(outboundHost, ignoredHosts) {
+					if rep.HasPairs() {
+						rewritten, replaceCount = rep.ToOriginalDiff(rewritten)
+					}
+					rewritten = unmaskRequestString(rewritten, outboundHost, scheme, proxyAddr)
 				}
-				rewritten = unmaskRequestString(rewritten, outboundHost, scheme, proxyAddr)
 				req.Body = io.NopCloser(strings.NewReader(rewritten))
 				req.ContentLength = int64(len(rewritten))
 				start := logger.LogRequest(req, rewritten, false, replaceCount)
@@ -1075,9 +1113,20 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		rewriteSetCookies(resp, false /* proxy listens on plain HTTP */)
 
 		// Strip headers that are tied to the upstream origin and would break
-		// the proxy (HSTS, key pinning).
+		// the proxy (HSTS, key pinning).  Runs unconditionally — even for ignored
+		// hosts — because these headers are security-relevant regardless of whether
+		// the user chose to bypass rewriting for this host.
 		for key := range headersStrip {
 			resp.Header.Del(key)
+		}
+
+		// For ignored hosts, all remaining rewriting (CSP, Location, body) is
+		// skipped.  Traffic flows through untouched so that functional strings
+		// embedded in the response (OAuth scopes, tenant IDs, library internals)
+		// are never corrupted by user-defined replacement pairs.
+		if isIgnoredHost(resp.Request.URL.Host, ignoredHosts) {
+			logger.LogResponse(resp, "", start, 0)
+			return nil
 		}
 
 		// Rewrite Content-Security-Policy: replace target-domain host sources

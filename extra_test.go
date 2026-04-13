@@ -521,7 +521,7 @@ func TestProxyRedirectDowngrade(t *testing.T) {
 
 			host := strings.TrimPrefix(upstream.URL, "http://")
 			rep, _ := NewReplacer("", false)
-			proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil)
+			proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil)
 			ps := httptest.NewServer(proxy)
 			defer ps.Close()
 
@@ -563,7 +563,7 @@ func TestProxyCSPHSTSStripped(t *testing.T) {
 
 	upstreamHost = strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -606,7 +606,7 @@ func TestProxy204NoBody(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -636,7 +636,7 @@ func TestProxy304NotModified(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -667,7 +667,7 @@ func TestProxyPOSTBodyReplacement(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme,ctfd:foo", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -701,7 +701,7 @@ func TestProxyRequestHeaderMasking(t *testing.T) {
 	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
 	const proxyAddr = "localhost:8080"
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -742,7 +742,7 @@ func TestProxyQueryStringReplacement(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme,ctfd:foo", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -766,7 +766,7 @@ func TestProxyCaseInsensitivePipeline(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme,ctfd:foo", true) // CI mode (the default)
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -804,7 +804,7 @@ func TestProxyXForwardedForStripped(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -848,7 +848,7 @@ func TestEffectiveProxyAddrContextPropagation(t *testing.T) {
 	rep, _ := NewReplacer("", false)
 	// proxyAddr uses "localhost" — but client will connect via 127.0.0.1.
 	proxyAddr := fmt.Sprintf("localhost:%d", port)
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil, nil)
 
 	srv := &http.Server{Handler: proxy}
 	go srv.Serve(ln) //nolint:errcheck
@@ -897,7 +897,7 @@ func TestProxyAcceptEncodingOverridden(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -930,7 +930,7 @@ func TestProxyLocationHeaderMasking(t *testing.T) {
 	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
 	const proxyAddr = "proxy.local:8080"
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -965,7 +965,7 @@ func TestProxyUserReplacementInLocationHeader(t *testing.T) {
 	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme", false)
 	const proxyAddr = "proxy.local:8080"
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -1006,7 +1006,7 @@ func TestProxySubdomainUserReplaceNotCorruptedInBody(t *testing.T) {
 	// Use rootHost as targetHost so subdomainRe matches "pic.ynet.co.il".
 	// fixedHostTransport routes all requests (including the subdomain ones) to
 	// the test upstream without real DNS.
-	proxy := NewReverseProxy(rootHost, "http", rep, false, proxyAddr, false, 0, testLogger(), nil)
+	proxy := NewReverseProxy(rootHost, "http", rep, false, proxyAddr, false, 0, testLogger(), nil, nil)
 	proxy.Transport = &fixedHostTransport{upstream: upstream}
 
 	ps := httptest.NewServer(proxy)
@@ -1045,7 +1045,7 @@ func TestProxyResponseHostAndUserReplacementCombined(t *testing.T) {
 	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme", false)
 	const proxyAddr = "localhost:8080"
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -1174,7 +1174,7 @@ func TestProxyCSPRewrittenInResponse(t *testing.T) {
 
 	upstreamHost = strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -1470,3 +1470,193 @@ func (p pipeRWC) Close() error                { p.w.Close(); return p.r.Close() 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// ─── -ignore-host ─────────────────────────────────────────────────────────────
+
+// TestIgnoredHostResponseNotRewritten verifies that responses from an ignored
+// host are NOT subject to string replacement or host masking in the body.
+// Simulates the real-world case where a JS bundle contains "microsoft-graph"
+// (an OAuth2 scope ID) that must not be corrupted by the replacement pairs.
+func TestIgnoredHostResponseNotRewritten(t *testing.T) {
+	const original = "microsoft"
+	const alias = "msctf"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		fmt.Fprint(w, `const scope = "microsoft-graph"; const tenant = "microsoft.com";`)
+	}))
+	defer upstream.Close()
+	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
+
+	rep, _ := NewReplacer(original+":"+alias, true)
+	ignored, _ := parseIgnoreHosts([]string{upstreamHost})
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, ignored)
+
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+
+	resp, err := http.Get(proxyServer.URL + "/script.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	// "microsoft-graph" and "microsoft.com" must be preserved verbatim.
+	if strings.Contains(string(body), alias) {
+		t.Errorf("ignored host body was rewritten: got %q, want original strings preserved", string(body))
+	}
+	if !strings.Contains(string(body), original) {
+		t.Errorf("ignored host body: expected original string %q to be present, got %q", original, string(body))
+	}
+}
+
+// TestIgnoredHostRequestNotRewritten verifies that outbound request paths are
+// NOT alias-replaced when the destination is an ignored host.
+func TestIgnoredHostRequestNotRewritten(t *testing.T) {
+	var receivedPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
+
+	rep, _ := NewReplacer("microsoft:msctf", true)
+	ignored, _ := parseIgnoreHosts([]string{upstreamHost})
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, ignored)
+
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+
+	// The alias "msctf" in the path must NOT be un-aliased to "microsoft"
+	// when the destination host is ignored.
+	http.Get(proxyServer.URL + "/msctf/token")
+
+	if receivedPath != "/msctf/token" {
+		t.Errorf("ignored host request path was rewritten: got %q, want /msctf/token", receivedPath)
+	}
+}
+
+// TestNonIgnoredHostStillReplaces confirms the ignore list only suppresses
+// rewriting on listed hosts; unlisted hosts are still fully rewritten.
+func TestNonIgnoredHostStillReplaces(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<p>example content</p>`)
+	}))
+	defer upstream.Close()
+	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
+
+	rep, _ := NewReplacer("example:demo", true)
+	// Ignore a different host — upstreamHost must still be rewritten.
+	ignored := map[string]bool{"some.other.host.example.com": true}
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, ignored)
+
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+
+	resp, err := http.Get(proxyServer.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if !strings.Contains(string(body), "demo") {
+		t.Errorf("non-ignored host body not rewritten: got %q, want 'demo'", string(body))
+	}
+}
+
+// TestIgnoredHostHSTSStillStripped verifies that HSTS is stripped even for
+// ignored hosts (security-critical header removal always runs).
+func TestIgnoredHostHSTSStillStripped(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
+
+	rep, _ := NewReplacer("", true)
+	ignored, _ := parseIgnoreHosts([]string{upstreamHost})
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, ignored)
+
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+
+	resp, err := http.Get(proxyServer.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if hsts := resp.Header.Get("Strict-Transport-Security"); hsts != "" {
+		t.Errorf("HSTS must be stripped even for ignored hosts, got %q", hsts)
+	}
+}
+
+// TestParseIgnoreHosts verifies flag parsing and validation.
+func TestParseIgnoreHosts(t *testing.T) {
+	t.Run("basic", func(t *testing.T) {
+		m, err := parseIgnoreHosts([]string{"login.microsoftonline.com"})
+		if err != nil || !m["login.microsoftonline.com"] {
+			t.Fatalf("basic: err=%v, map=%v", err, m)
+		}
+	})
+	t.Run("comma-separated", func(t *testing.T) {
+		m, err := parseIgnoreHosts([]string{"foo.com,bar.com"})
+		if err != nil || !m["foo.com"] || !m["bar.com"] {
+			t.Fatalf("comma-separated: err=%v, map=%v", err, m)
+		}
+	})
+	t.Run("lowercased", func(t *testing.T) {
+		m, err := parseIgnoreHosts([]string{"Login.MicrosoftOnline.Com"})
+		if err != nil || !m["login.microsoftonline.com"] {
+			t.Fatalf("lowercased: err=%v, map=%v", err, m)
+		}
+	})
+	t.Run("rejects-scheme", func(t *testing.T) {
+		if _, err := parseIgnoreHosts([]string{"https://foo.com"}); err == nil {
+			t.Error("expected error for host with scheme")
+		}
+	})
+	t.Run("rejects-path", func(t *testing.T) {
+		if _, err := parseIgnoreHosts([]string{"foo.com/path"}); err == nil {
+			t.Error("expected error for host with path")
+		}
+	})
+	t.Run("nil-input", func(t *testing.T) {
+		m, err := parseIgnoreHosts(nil)
+		if err != nil || m != nil {
+			t.Errorf("expected nil,nil; got %v,%v", m, err)
+		}
+	})
+}
+
+// TestIsIgnoredHost unit-tests the isIgnoredHost helper directly.
+func TestIsIgnoredHost(t *testing.T) {
+	ignored := map[string]bool{
+		"login.microsoftonline.com": true,
+		"graph.microsoft.com":       true,
+	}
+	cases := []struct {
+		host string
+		want bool
+	}{
+		{"login.microsoftonline.com", true},
+		{"login.microsoftonline.com:443", true},   // port must be stripped
+		{"LOGIN.MicrosoftOnline.COM", true},        // case-insensitive lookup
+		{"graph.microsoft.com", true},
+		{"microsoft.com", false},                   // parent domain not ignored
+		{"api.graph.microsoft.com", false},         // child subdomain not ignored
+		{"evil.login.microsoftonline.com", false},  // prefix subdomain not ignored
+		{"", false},                                // empty host is never ignored
+	}
+	for _, c := range cases {
+		got := isIgnoredHost(c.host, ignored)
+		if got != c.want {
+			t.Errorf("isIgnoredHost(%q) = %v, want %v", c.host, got, c.want)
+		}
+	}
+}

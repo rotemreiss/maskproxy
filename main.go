@@ -5,9 +5,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -29,6 +31,18 @@ Options:
   -replace-file <path>     Path to a file with one original:alias pair per line.
                            Lines starting with '#' and blank lines are ignored.
                            Combined with any -replace pairs (CLI pairs win on conflict).
+  -ignore-host  <hosts>    Comma-separated list of upstream hostnames to exclude
+                            from all proxy rewriting (repeatable).
+                            Traffic to these hosts still flows through the proxy
+                            but bodies and headers are passed through unchanged:
+                            no host masking, no string replacement.
+                            Security-critical headers (HSTS, key pinning) and
+                            Set-Cookie cleanup still run for ignored hosts.
+                            Use this to protect hosts whose responses contain
+                            library-internal strings (e.g. OAuth scope IDs in
+                            an MSAL bundle) that must not be touched.
+                            Example: -ignore-host login.microsoftonline.com
+                                     -ignore-host graph.microsoft.com,cdn.msauth.net
   -header       <h>        Add a header to every upstream request (repeatable).
                            Format: "Name: Value". Overrides same-named client headers.
                            Example: -header "X-Author: Rotem" -header "X-Token: abc"
@@ -104,6 +118,19 @@ func (h *headerFlag) Set(s string) error {
 	return nil
 }
 
+// ignoreHostFlag is a repeatable -ignore-host flag value.  Each call to Set
+// appends one or more comma-separated hostnames.
+type ignoreHostFlag []string
+
+func (f *ignoreHostFlag) String() string { return strings.Join(*f, ", ") }
+func (f *ignoreHostFlag) Set(s string) error {
+	if strings.TrimSpace(s) == "" {
+		return fmt.Errorf("ignore-host value must not be empty")
+	}
+	*f = append(*f, s)
+	return nil
+}
+
 func main() {
 	target := flag.String("target", "", "Upstream host (required, no scheme)")
 	replace := flag.String("replace", "", "Comma-separated original:alias pairs, e.g. ctf:acme,ctfd:foo")
@@ -121,6 +148,8 @@ func main() {
 	drain := flag.Duration("drain", 15*time.Second, "Grace period for in-flight requests on SIGINT/SIGTERM")
 	var headers headerFlag
 	flag.Var(&headers, "header", `Add a header to every upstream request (repeatable). Format: "Name: Value". Example: -header "X-Author: Rotem"`)
+	var ignoreHosts ignoreHostFlag
+	flag.Var(&ignoreHosts, "ignore-host", `Exclude hosts from all proxy rewriting (comma-separated, repeatable). Example: -ignore-host login.microsoftonline.com,graph.microsoft.com`)
 
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -174,6 +203,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Parse and validate -ignore-host flags into a lowercase set.
+	ignoredHostsMap, err := parseIgnoreHosts(ignoreHosts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: -ignore-host: %v\n", err)
+		os.Exit(1)
+	}
+
 	logger, closeLog, err := NewLogger(*verbose, !*wsNoLog, *logFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -187,7 +223,7 @@ func main() {
 	}
 
 	pAddr := proxyAddr(*listen, *port)
-	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger, extraHeaders)
+	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger, extraHeaders, ignoredHostsMap)
 
 	addr := fmt.Sprintf("%s:%d", *listen, *port)
 	logger.Printf("maskproxy listening on http://%s", addr)
@@ -209,6 +245,15 @@ func main() {
 			}
 			logger.Printf("  → extra header: %s: %s", h.name, val)
 		}
+	}
+	if len(ignoredHostsMap) > 0 {
+		// Collect and sort for deterministic output.
+		sorted := make([]string, 0, len(ignoredHostsMap))
+		for h := range ignoredHostsMap {
+			sorted = append(sorted, h)
+		}
+		sort.Strings(sorted)
+		logger.Printf("  → ignored hosts (no rewriting): %s", strings.Join(sorted, ", "))
 	}
 	if *exactDomain {
 		logger.Printf("  → subdomain masking: disabled (-exact-domain)")
@@ -327,6 +372,42 @@ func parseHeaders(raw []string) ([]headerPair, error) {
 		pairs = append(pairs, headerPair{name: name, value: value})
 	}
 	return pairs, nil
+}
+
+// parseIgnoreHosts converts the raw "-ignore-host" strings (each may be a
+// comma-separated list) into a lowercase hostname set for O(1) lookup.
+//
+// Validation:
+//   - Each token must be a bare hostname or host:port — no scheme, no path.
+//   - Ports are stripped at parse time: "login.microsoft.com:443" → "login.microsoft.com".
+//   - Hostnames are lowercased so lookups are case-insensitive.
+//   - Empty tokens (e.g. trailing commas) are silently skipped.
+func parseIgnoreHosts(raw []string) (map[string]bool, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	result := make(map[string]bool)
+	for _, entry := range raw {
+		for _, token := range strings.Split(entry, ",") {
+			host := strings.TrimSpace(token)
+			if host == "" {
+				continue
+			}
+			// Reject obvious scheme or path presence.
+			if strings.Contains(host, "://") {
+				return nil, fmt.Errorf("ignore-host %q must not include a scheme (use the bare hostname)", host)
+			}
+			if strings.ContainsAny(host, "/ ") {
+				return nil, fmt.Errorf("ignore-host %q must be a hostname (no path or spaces)", host)
+			}
+			// Strip port so that "host:443" and "host" both normalise to "host".
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+			result[strings.ToLower(host)] = true
+		}
+	}
+	return result, nil
 }
 
 
