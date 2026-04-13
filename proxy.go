@@ -301,6 +301,17 @@ func rewriteSetCookies(resp *http.Response, proxyIsHTTPS bool, subHost string) {
 			}
 		}
 		if !proxyIsHTTPS {
+			// Strip __Host- and __Secure- cookie name prefixes before removing
+			// the Secure flag.  Both prefixes require the Secure attribute; once
+			// Secure is gone the browser rejects the cookie entirely.  Renaming
+			// preserves the session by dropping the security guarantee (which is
+			// acceptable in a local proxy/CTF context).
+			if strings.HasPrefix(c.Name, "__Host-") {
+				c.Name = strings.TrimPrefix(c.Name, "__Host-")
+				// __Host- also requires Path=/ and no Domain — both already handled.
+			} else if strings.HasPrefix(c.Name, "__Secure-") {
+				c.Name = strings.TrimPrefix(c.Name, "__Secure-")
+			}
 			c.Secure = false
 			// SameSite=None without Secure is rejected by browsers; downgrade.
 			if c.SameSite == http.SameSiteNoneMode {

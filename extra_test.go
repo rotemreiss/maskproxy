@@ -331,6 +331,45 @@ func TestRewriteSetCookiesUnit(t *testing.T) {
 			t.Errorf("main target cookie Path incorrectly modified: %q", sc)
 		}
 	})
+
+	t.Run("__Host- prefix stripped when Secure removed", func(t *testing.T) {
+		resp := &http.Response{Header: http.Header{}}
+		resp.Header.Add("Set-Cookie", "__Host-session=abc; Path=/; Secure; HttpOnly")
+		rewriteSetCookies(resp, false, "")
+		sc := resp.Header.Get("Set-Cookie")
+		if strings.HasPrefix(sc, "__Host-") {
+			t.Errorf("__Host- prefix not stripped when Secure removed: %q", sc)
+		}
+		if !strings.Contains(sc, "session=abc") {
+			t.Errorf("cookie value lost after prefix strip: %q", sc)
+		}
+		if strings.Contains(strings.ToLower(sc), "secure") {
+			t.Errorf("Secure flag not removed: %q", sc)
+		}
+	})
+
+	t.Run("__Secure- prefix stripped when Secure removed", func(t *testing.T) {
+		resp := &http.Response{Header: http.Header{}}
+		resp.Header.Add("Set-Cookie", "__Secure-token=xyz; Path=/; Secure")
+		rewriteSetCookies(resp, false, "")
+		sc := resp.Header.Get("Set-Cookie")
+		if strings.HasPrefix(sc, "__Secure-") {
+			t.Errorf("__Secure- prefix not stripped when Secure removed: %q", sc)
+		}
+		if !strings.Contains(sc, "token=xyz") {
+			t.Errorf("cookie value lost after prefix strip: %q", sc)
+		}
+	})
+
+	t.Run("__Host- prefix kept when proxy is HTTPS", func(t *testing.T) {
+		resp := &http.Response{Header: http.Header{}}
+		resp.Header.Add("Set-Cookie", "__Host-session=abc; Path=/; Secure; HttpOnly")
+		rewriteSetCookies(resp, true, "") // proxy is HTTPS — keep Secure + prefix
+		sc := resp.Header.Get("Set-Cookie")
+		if !strings.HasPrefix(sc, "__Host-") {
+			t.Errorf("__Host- prefix incorrectly stripped for HTTPS proxy: %q", sc)
+		}
+	})
 }
 
 // ─── maskResponseString: rootDomain step 5 ────────────────────────────────────
