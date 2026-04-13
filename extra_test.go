@@ -2884,3 +2884,70 @@ func TestSecFetchAndUpgradeInsecureStripped(t *testing.T) {
 		}
 	}
 }
+
+// TestSubdomainSPAScriptInjected verifies that a subdomain HTML response has
+// the SPA pathname-patching <script> injected immediately after <head>.
+// The script rewrites window.location.pathname to strip the /__sd__/<host>
+// prefix so that SPA routers (Remix, React Router, Next.js) can match routes.
+func TestSubdomainSPAScriptInjected(t *testing.T) {
+	const subHost = "copilot.example.com"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<!DOCTYPE html><html><head><title>App</title></head><body><h1>Hi</h1></body></html>")
+	}))
+	defer upstream.Close()
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy("example.com", "http", rep, false, "localhost:9045", false, 0, testLogger(), nil, nil, 0)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	req, _ := http.NewRequest("GET", ps.URL+"/__sd__/"+subHost+"/", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, "/__sd__/"+subHost) {
+		t.Errorf("SPA script prefix not found in subdomain HTML response.\ngot:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "history.replaceState") {
+		t.Errorf("history.replaceState not found in injected script:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "window.fetch") {
+		t.Errorf("fetch patching not found in injected script:\n%s", bodyStr)
+	}
+}
+
+// TestSubdomainSPAScriptNotInjectedForMainTarget verifies that the SPA script
+// is NOT injected for responses from the main target host.
+func TestSubdomainSPAScriptNotInjectedForMainTarget(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<!DOCTYPE html><html><head><title>Main</title></head><body></body></html>")
+	}))
+	defer upstream.Close()
+
+	mainHost := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(mainHost, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := http.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if strings.Contains(string(body), "history.replaceState") {
+		t.Errorf("SPA script injected for main target response (should not be):\n%s", body)
+	}
+}

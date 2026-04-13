@@ -7,6 +7,7 @@ import (
 	"compress/zlib"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -113,6 +114,29 @@ var linkIntegrityRe = regexp.MustCompile(`(?i);\s*integrity\s*=\s*(?:"[^"]*"|'[^
 
 // maxBodyRewriteDefault is the default maximum body size for rewriting.
 const maxBodyRewriteDefault = int64(50 * 1024 * 1024) // 50 MiB
+
+// subdomainSPAScript is injected into the <head> of every subdomain HTML page.
+//
+// Problem: the browser is at http://localhost:PORT/__sd__/<host>/path, so
+// window.location.pathname === "/__sd__/<host>/path".  SPA frameworks (Remix,
+// React Router, Next.js, etc.) read location.pathname to match routes.  Their
+// route table was generated for the original server where the path is just
+// "/path" — not the proxy-prefixed form.  The mismatch causes invariant failures
+// ("No routes matched location") or hard client-side crashes.
+//
+// Fix: patch the browser's visible URL with history.replaceState so the SPA
+// router sees "/path" instead of "/__sd__/<host>/path".  Also patch
+// history.pushState / replaceState to transparently re-add the proxy prefix so
+// that subsequent SPA navigations stay routed through /__sd__/<host>/.  Fetch
+// and XHR root-relative calls are likewise prefixed so API requests don't
+// accidentally route to the main proxy target.
+//
+// %s is replaced with the /__sd__/<host> prefix (e.g. "/__sd__/copilot.microsoft.com").
+const subdomainSPAScript = `<script>(function(){var pfx=%q;if(!location.pathname.startsWith(pfx))return;var path=location.pathname.slice(pfx.length)||'/';history.replaceState(history.state,document.title,path+location.search+location.hash);['pushState','replaceState'].forEach(function(fn){var o=history[fn].bind(history);history[fn]=function(st,ti,url){if(typeof url==='string'&&url.startsWith('/')&&!url.startsWith('/__sd__/'))url=pfx+url;return o(st,ti,url);};});var oF=window.fetch;window.fetch=function(i,o){if(typeof i==='string'&&i.startsWith('/')&&!i.startsWith('/__sd__/'))i=pfx+i;return oF.call(this,i,o);};var oX=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/'))u=pfx+u;return oX.apply(this,arguments);};})();</script>`
+
+// headTagRe matches an opening <head> tag (with optional attributes) to find
+// the injection point for the subdomain SPA script.
+var headTagRe = regexp.MustCompile(`(?i)<head[^>]*>`)
 
 // subdomainPrefix is the URL path prefix used to encode subdomain routing.
 // When the response masker rewrites "https://assets.example.com/foo.js" to a
@@ -1793,8 +1817,29 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// Pass 2: if this response came from a subdomain host (not the main target),
 		// rewrite root-relative paths so browsers resolve them against the subdomain
 		// /__sd__/ route rather than the proxy root.
-		if reqHost := resp.Request.URL.Host; !strings.EqualFold(reqHost, targetHost) && reqHost != "" {
+		reqHost := resp.Request.URL.Host
+		isSubdomain := !strings.EqualFold(reqHost, targetHost) && reqHost != ""
+		if isSubdomain {
 			rewritten = rewriteRootRelativePaths(rewritten, reqHost)
+		}
+
+		// Pass 2b: for subdomain HTML pages inject the SPA pathname-patching
+		// script at the start of <head>.  This fixes SPA frameworks (Remix,
+		// Next.js, React Router) that read window.location.pathname and fail
+		// when they see "/__sd__/<host>/path" instead of the expected "/path".
+		// The script:
+		//   1. Rewrites the visible URL with history.replaceState so the router
+		//      sees the real application path.
+		//   2. Patches history.pushState/replaceState to transparently re-add the
+		//      proxy routing prefix so subsequent SPA navigations route correctly.
+		//   3. Patches fetch() and XMLHttpRequest so root-relative API calls
+		//      are sent to the subdomain host, not the main proxy target.
+		if isSubdomain && strings.HasPrefix(contentType, "text/html") {
+			pfx := subdomainPrefix + reqHost // e.g. "/__sd__/copilot.microsoft.com"
+			script := fmt.Sprintf(subdomainSPAScript, pfx)
+			rewritten = headTagRe.ReplaceAllStringFunc(rewritten, func(tag string) string {
+				return tag + script
+			})
 		}
 
 		// Pass 2b: strip SRI integrity attributes from HTML.
