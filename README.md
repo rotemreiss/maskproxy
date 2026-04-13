@@ -1,12 +1,25 @@
-# ctfproxy
+# maskproxy
 
 A lightweight, transparent rewriting reverse proxy written in Go.  
 It forwards local HTTP traffic to a remote host and rewrites configurable strings bidirectionally — aliases in the client view, originals on the wire.
 
-## Build
+## Install
+
+**From GitHub (no clone needed):**
 
 ```bash
-go build -o ctfproxy .
+go install github.com/rotemreiss/maskproxy@latest
+```
+
+The binary will be placed in `$(go env GOPATH)/bin/maskproxy` (typically `~/go/bin/maskproxy`).  
+Make sure that directory is in your `$PATH`.
+
+**Build from source:**
+
+```bash
+git clone https://github.com/rotemreiss/maskproxy.git
+cd maskproxy
+go build -o maskproxy .
 ```
 
 ## Usage

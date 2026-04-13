@@ -1,3 +1,3 @@
-module github.com/ctfproxy
+module github.com/rotemreiss/maskproxy
 
 go 1.21
