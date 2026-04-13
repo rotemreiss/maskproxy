@@ -367,6 +367,13 @@ var headersStrip = map[string]bool{
 	"Accept-Ch":          true,
 	"Accept-Ch-Lifetime": true, // deprecated but still seen in the wild
 	"Critical-Ch":        true,
+
+	// Digest and Content-Digest carry a cryptographic hash of the response body
+	// (RFC 3230 / RFC 9530).  After the proxy rewrites body content (host names,
+	// replacement strings) the hash is stale and verification by the client would
+	// fail.  Strip both so clients don't reject the rewritten body.
+	"Digest":         true,
+	"Content-Digest": true,
 }
 
 // textContentTypes lists MIME type prefixes for which body replacement is safe.
