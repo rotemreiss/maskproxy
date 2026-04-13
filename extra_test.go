@@ -19,6 +19,7 @@ package main
 import (
 	"bytes"
 	"compress/flate"
+	"compress/gzip"
 	"compress/zlib"
 	"fmt"
 	"io"
@@ -124,6 +125,12 @@ func TestUnmaskRequestString(t *testing.T) {
 			in:     "Referer: http://localhost:8080/ctf/dashboard",
 			target: "ctf.io", scheme: "https", proxy: "localhost:8080",
 			want: "Referer: https://ctf.io/ctf/dashboard",
+		},
+		{
+			desc:   "protocol-relative //proxyAddr/ rewritten to //targetHost/",
+			in:     "//localhost:8080/static/app.js",
+			target: "ctf.io", scheme: "https", proxy: "localhost:8080",
+			want: "//ctf.io/static/app.js",
 		},
 	}
 	for _, c := range cases {
@@ -2361,4 +2368,79 @@ t.Fatal("SSE response timed out — proxy is buffering the entire stream")
 }
 // Close the pipe to let the upstream handler finish.
 pw.Close()
+}
+
+// TestRemoveVaryAcceptEncoding verifies that Accept-Encoding is stripped from
+// Vary after decompression while other Vary values are preserved.
+func TestRemoveVaryAcceptEncoding(t *testing.T) {
+cases := []struct {
+desc   string
+vary   []string // initial Vary header values
+want   string   // expected Vary after removal ("" = header deleted)
+}{
+{"only Accept-Encoding", []string{"Accept-Encoding"}, ""},
+{"Accept-Encoding with other", []string{"Accept-Encoding, Accept-Language"}, "Accept-Language"},
+{"multiple values, one has AE", []string{"Accept-Language", "Accept-Encoding"}, "Accept-Language"},
+{"no Vary header", nil, ""},
+{"case-insensitive", []string{"accept-encoding"}, ""},
+{"AE only with spaces", []string{" Accept-Encoding "}, ""},
+}
+for _, c := range cases {
+t.Run(c.desc, func(t *testing.T) {
+h := http.Header{}
+for _, v := range c.vary {
+h.Add("Vary", v)
+}
+removeVaryAcceptEncoding(h)
+got := h.Get("Vary")
+// Normalise: trim spaces for comparison.
+got = strings.TrimSpace(got)
+if got != c.want {
+t.Errorf("got Vary=%q, want %q", got, c.want)
+}
+})
+}
+}
+
+// TestVaryAcceptEncodingStrippedAfterDecompress verifies that a gzip response
+// whose Vary header includes Accept-Encoding has that directive removed by the
+// proxy after decompression (since the body is now identity-encoded).
+func TestVaryAcceptEncodingStrippedAfterDecompress(t *testing.T) {
+var buf bytes.Buffer
+gz := gzip.NewWriter(&buf)
+fmt.Fprint(gz, "hello world")
+gz.Close()
+
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+w.Header().Set("Content-Encoding", "gzip")
+w.Header().Set("Vary", "Accept-Encoding, Accept-Language")
+w.Header().Set("Content-Type", "text/plain")
+w.Write(buf.Bytes())
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("", false)
+proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+resp, err := http.Get(ps.URL + "/")
+if err != nil {
+t.Fatal(err)
+}
+resp.Body.Close()
+
+vary := resp.Header.Get("Vary")
+if strings.Contains(strings.ToLower(vary), "accept-encoding") {
+t.Errorf("Vary still contains Accept-Encoding after gzip decompression: %q", vary)
+}
+// Accept-Language must still be present.
+if !strings.Contains(vary, "Accept-Language") {
+t.Errorf("Vary lost Accept-Language: %q", vary)
+}
+// Content-Encoding must be gone.
+if ce := resp.Header.Get("Content-Encoding"); ce != "" {
+t.Errorf("Content-Encoding not stripped: %q", ce)
+}
 }

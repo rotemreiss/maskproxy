@@ -742,8 +742,41 @@ func unmaskRequestString(s, targetHost, scheme, proxyAddr string) string {
 	}
 	upstreamBase := scheme + "://" + targetHost
 	s = strings.ReplaceAll(s, "http://"+proxyAddr, upstreamBase)
+	// Also rewrite the protocol-relative form "//proxyAddr" that may appear in
+	// request headers like Referer or Origin when the browser constructs them
+	// from a page served via the proxy.
+	s = strings.ReplaceAll(s, "//"+proxyAddr+"/", "//"+targetHost+"/")
 	s = strings.ReplaceAll(s, proxyAddr, targetHost)
 	return s
+}
+
+// removeVaryAcceptEncoding removes "Accept-Encoding" from the Vary header
+// after decompressing the response body.  Once the body is identity-encoded
+// there is no variant for Accept-Encoding; leaving the directive would
+// confuse downstream caches.
+func removeVaryAcceptEncoding(h http.Header) {
+	varyVals := h["Vary"]
+	if len(varyVals) == 0 {
+		return
+	}
+	out := varyVals[:0]
+	for _, v := range varyVals {
+		parts := strings.Split(v, ",")
+		kept := parts[:0]
+		for _, p := range parts {
+			if !strings.EqualFold(strings.TrimSpace(p), "Accept-Encoding") {
+				kept = append(kept, p)
+			}
+		}
+		if len(kept) > 0 {
+			out = append(out, strings.Join(kept, ","))
+		}
+	}
+	if len(out) == 0 {
+		h.Del("Vary")
+	} else {
+		h["Vary"] = out
+	}
 }
 
 // ── SSRF guard transport ──────────────────────────────────────────────────────
@@ -1474,6 +1507,10 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			defer gz.Close()
 			bodyReader = gz
 			resp.Header.Del("Content-Encoding")
+			// Strip Vary: Accept-Encoding — the body is no longer compressed, so
+			// different encodings would produce identical content.  Leaving it
+			// confuses downstream caches into thinking variants exist.
+			removeVaryAcceptEncoding(resp.Header)
 		}
 		if isDeflate {
 			// HTTP "deflate" is ambiguous: some servers send zlib-wrapped DEFLATE
@@ -1508,6 +1545,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			defer dr.Close()
 			bodyReader = dr
 			resp.Header.Del("Content-Encoding")
+			removeVaryAcceptEncoding(resp.Header)
 		}
 
 		raw, err := io.ReadAll(io.LimitReader(bodyReader, maxBodyBytes+1))
