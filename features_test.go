@@ -123,3 +123,26 @@ func TestLoadReplaceFileInvalidLine(t *testing.T) {
 		t.Error("expected error for invalid line, got nil")
 	}
 }
+
+// BenchmarkReplacerToAlias measures the hot-path cost of response body replacement.
+// Run with: go test -bench=BenchmarkReplacer -benchtime=5s
+func BenchmarkReplacerToAlias(b *testing.B) {
+rep, _ := NewReplacer("microsoft:msctf,windows:winx,azure:cloudx", false)
+body := strings.Repeat("Visit https://www.microsoft.com for windows and azure info. ", 500)
+b.ResetTimer()
+b.ReportAllocs()
+for i := 0; i < b.N; i++ {
+_ = rep.ToAlias(body)
+}
+}
+
+// BenchmarkReplacerToOriginal measures the hot-path cost of request rewriting.
+func BenchmarkReplacerToOriginal(b *testing.B) {
+rep, _ := NewReplacer("microsoft:msctf,windows:winx,azure:cloudx", false)
+body := strings.Repeat("Visit https://www.msctf.com for winx and cloudx info. ", 500)
+b.ResetTimer()
+b.ReportAllocs()
+for i := 0; i < b.N; i++ {
+_ = rep.ToOriginal(body)
+}
+}

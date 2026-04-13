@@ -1700,3 +1700,60 @@ func TestIsIgnoredHost(t *testing.T) {
 		}
 	}
 }
+
+// ─── SVG body rewriting ───────────────────────────────────────────────────────
+
+// TestSVGBodyRewrite verifies that image/svg+xml responses undergo host masking
+// and user-string replacement, since SVG is a text/XML format.
+//
+// The upstream serves an SVG that references its own host (as would happen in a
+// real site that embeds absolute self-references).  maskResponseString converts
+// those upstream-host URLs to proxy-local ones, and the user alias replaces any
+// remaining alias strings in the path.
+func TestSVGBodyRewrite(t *testing.T) {
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Embed the upstream's own address as would happen with a real SVG asset.
+		upHost := strings.TrimPrefix(upstream.URL, "http://")
+		svgBody := `<svg xmlns="http://www.w3.org/2000/svg">` +
+			`<image href="http://` + upHost + `/ctflogo.png"/>` +
+			`<text>Plain ctf text</text>` +
+			`</svg>`
+		w.Header().Set("Content-Type", "image/svg+xml")
+		fmt.Fprint(w, svgBody)
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("ctf:acme", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/logo.svg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got, _ := io.ReadAll(resp.Body)
+	body := string(got)
+
+	// The upstream host URL must be rewritten to the proxy address.
+	if strings.Contains(body, host) {
+		t.Errorf("SVG body still contains upstream host %q:\n%s", host, body)
+	}
+	// The user alias "ctf"→"acme" must apply to text content (e.g. the image path).
+	if strings.Contains(body, "ctflogo.png") {
+		t.Errorf("SVG body path 'ctflogo.png' was not rewritten to 'acmelogo.png':\n%s", body)
+	}
+	if !strings.Contains(body, "acmelogo.png") {
+		t.Errorf("SVG body missing expected 'acmelogo.png':\n%s", body)
+	}
+	// Plain text "ctf" inside SVG should also be replaced.
+	if strings.Contains(body, "Plain ctf text") {
+		t.Errorf("SVG text 'Plain ctf text' was not replaced:\n%s", body)
+	}
+	if !strings.Contains(body, "Plain acme text") {
+		t.Errorf("SVG text missing 'Plain acme text':\n%s", body)
+	}
+}
