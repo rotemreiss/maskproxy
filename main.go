@@ -73,6 +73,11 @@ Options:
                            Use this flag to silence that output.
   -log          <path>     Append all log output to <path> in addition to stderr.
                            Works with both normal and -verbose mode.
+  -max-body     <n>        Maximum body size in MiB to buffer for rewriting
+                           (default: 50 MiB).  Bodies larger than this limit
+                           are forwarded unchanged (no string replacement).
+                           Increase for large HTML files; decrease to reduce
+                           memory pressure on memory-limited hosts.
   -port         <n>        Local port to listen on (default: 8080).
   -listen       <addr>     Local listen address (default: 0.0.0.0).
                            Use "127.0.0.1" to restrict to loopback only.
@@ -147,6 +152,7 @@ func main() {
 	port := flag.Int("port", 8080, "Local port to listen on")
 	listen := flag.String("listen", "0.0.0.0", "Local listen address")
 	drain := flag.Duration("drain", 15*time.Second, "Grace period for in-flight requests on SIGINT/SIGTERM")
+	maxBody := flag.Int64("max-body", 50, "Maximum response/request body size to buffer for rewriting, in MiB (0 = default 50 MiB)")
 	var headers headerFlag
 	flag.Var(&headers, "header", `Add a header to every upstream request (repeatable). Format: "Name: Value". Example: -header "X-Author: Rotem"`)
 	var ignoreHosts ignoreHostFlag
@@ -224,7 +230,8 @@ func main() {
 	}
 
 	pAddr := proxyAddr(*listen, *port)
-	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger, extraHeaders, ignoredHostsMap)
+	maxBodyBytes := *maxBody * 1024 * 1024
+	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger, extraHeaders, ignoredHostsMap, maxBodyBytes)
 
 	addr := fmt.Sprintf("%s:%d", *listen, *port)
 	logger.Printf("maskproxy listening on http://%s", addr)

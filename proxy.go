@@ -90,10 +90,8 @@ var metaRefreshRe = regexp.MustCompile(`(?i)(content\s*=\s*["'][0-9]+\s*;\s*url=
 // Group 1 = the root-relative path (the part between < and >).
 var linkHeaderRe = regexp.MustCompile(`<(/[^/][^>]*)>`)
 
-// maxBodyRewrite is the maximum response body size (in bytes) that will be
-// buffered and rewritten. Responses larger than this are forwarded unchanged to
-// prevent out-of-memory conditions when proxying large file downloads.
-const maxBodyRewrite = 50 * 1024 * 1024 // 50 MiB
+// maxBodyRewriteDefault is the default maximum body size for rewriting.
+const maxBodyRewriteDefault = int64(50 * 1024 * 1024) // 50 MiB
 
 // subdomainPrefix is the URL path prefix used to encode subdomain routing.
 // When the response masker rewrites "https://assets.example.com/foo.js" to a
@@ -929,7 +927,10 @@ func (c *wsLoggingConn) Close() error { return c.rwc.Close() }
 //
 // logger handles all per-request and startup logging; pass a Logger constructed
 // with NewLogger.
-func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger, extraHeaders []headerPair, ignoredHosts map[string]bool) *httputil.ReverseProxy {
+func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger, extraHeaders []headerPair, ignoredHosts map[string]bool, maxBodyBytes int64) *httputil.ReverseProxy {
+	if maxBodyBytes <= 0 {
+		maxBodyBytes = maxBodyRewriteDefault
+	}
 	// Convert the flat map into a typed set with separate exact/wildcard buckets
 	// so that isIgnoredHost does not pay O(n) map iteration for wildcard matching.
 	ignored := newIgnoredHostSet(ignoredHosts)
@@ -1154,11 +1155,11 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			reqCT := req.Header.Get("Content-Type")
 			bodyIsText := reqCT == "" || isTextContent(reqCT)
 
-			// Read up to maxBodyRewrite+1 bytes to detect oversized bodies.
+			// Read up to maxBodyBytes+1 bytes to detect oversized bodies.
 			// Do NOT close req.Body yet — the tail of the stream may still be there.
-			raw, err := io.ReadAll(io.LimitReader(req.Body, maxBodyRewrite+1))
+			raw, err := io.ReadAll(io.LimitReader(req.Body, maxBodyBytes+1))
 			if err == nil {
-				if int64(len(raw)) > maxBodyRewrite || !bodyIsText {
+				if int64(len(raw)) > maxBodyBytes || !bodyIsText {
 					// Body too large or binary: stitch already-read prefix back with
 					// the remaining stream (like the response path does) so no bytes
 					// are lost.  ContentLength stays at the original value so the
@@ -1181,6 +1182,10 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 					start := logger.LogRequest(req, rewritten, false, replaceCount)
 					reqTimes.Store(req, start)
 				}
+			} else {
+				// Body read failed — still record timing so modifyResponse can log duration.
+				start := logger.LogRequest(req, "", false, 0)
+				reqTimes.Store(req, start)
 			}
 		} else {
 			// Bodyless request (GET, HEAD, etc.) — still log + record start time.
@@ -1407,7 +1412,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			resp.Header.Del("Content-Encoding")
 		}
 
-		raw, err := io.ReadAll(io.LimitReader(bodyReader, maxBodyRewrite+1))
+		raw, err := io.ReadAll(io.LimitReader(bodyReader, maxBodyBytes+1))
 		if err != nil {
 			return err
 		}
@@ -1417,8 +1422,8 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// prefix back together with the remaining stream via io.MultiReader.
 		// For gzip, the compressed stream is already partially consumed and cannot
 		// be reconstructed; we forward the decompressed portion and log a warning.
-		if int64(len(raw)) > maxBodyRewrite {
-			logger.Printf("maskproxy: response body exceeds %d bytes; skipping rewrite", maxBodyRewrite)
+		if int64(len(raw)) > maxBodyBytes {
+			logger.Printf("maskproxy: response body exceeds %d bytes; skipping rewrite", maxBodyBytes)
 			logger.LogResponse(resp, "", start, 0)
 			if isGzip {
 				resp.Body = io.NopCloser(bytes.NewReader(raw))

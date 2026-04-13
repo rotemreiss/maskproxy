@@ -72,6 +72,7 @@ maskproxy -target <host> [options]
 | `-verbose` | Log every request/response with full headers and a body preview. Sensitive headers are redacted. |
 | `-ws-no-log` | Suppress WebSocket frame logging. By default every WS frame opcode and payload length is logged to stderr. |
 | `-log <path>` | Append all log output to a file in addition to stderr. |
+| `-max-body <n>` | Maximum body size (MiB) to buffer for rewriting (default: `50`). Bodies larger than this are forwarded unchanged. Increase for large HTML pages; decrease to reduce memory usage. |
 | `-drain <duration>` | Grace period to drain in-flight requests on Ctrl+C / SIGTERM (default: `15s`). |
 
 ## Examples
