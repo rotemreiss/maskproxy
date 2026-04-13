@@ -1637,6 +1637,28 @@ func TestParseIgnoreHosts(t *testing.T) {
 			t.Errorf("expected nil,nil; got %v,%v", m, err)
 		}
 	})
+	t.Run("wildcard-stored-as-suffix", func(t *testing.T) {
+		m, err := parseIgnoreHosts([]string{"*.bbci.co.uk"})
+		if err != nil {
+			t.Fatalf("wildcard: unexpected error: %v", err)
+		}
+		// Must be stored as ".bbci.co.uk" (dot prefix), not "*.bbci.co.uk".
+		if !m[".bbci.co.uk"] {
+			t.Errorf("wildcard key not found; map=%v", m)
+		}
+		if m["*.bbci.co.uk"] {
+			t.Error("raw wildcard key must not be stored")
+		}
+	})
+	t.Run("wildcard-mixed", func(t *testing.T) {
+		m, err := parseIgnoreHosts([]string{"exact.com,*.cdn.example.com"})
+		if err != nil {
+			t.Fatalf("mixed: unexpected error: %v", err)
+		}
+		if !m["exact.com"] || !m[".cdn.example.com"] {
+			t.Errorf("missing keys; map=%v", m)
+		}
+	})
 }
 
 // TestIsIgnoredHost unit-tests the isIgnoredHost helper directly.
@@ -1644,19 +1666,27 @@ func TestIsIgnoredHost(t *testing.T) {
 	ignored := map[string]bool{
 		"login.microsoftonline.com": true,
 		"graph.microsoft.com":       true,
+		".bbci.co.uk":               true, // wildcard suffix (*.bbci.co.uk)
 	}
 	cases := []struct {
 		host string
 		want bool
 	}{
 		{"login.microsoftonline.com", true},
-		{"login.microsoftonline.com:443", true},   // port must be stripped
-		{"LOGIN.MicrosoftOnline.COM", true},        // case-insensitive lookup
+		{"login.microsoftonline.com:443", true},  // port must be stripped
+		{"LOGIN.MicrosoftOnline.COM", true},       // case-insensitive lookup
 		{"graph.microsoft.com", true},
-		{"microsoft.com", false},                   // parent domain not ignored
-		{"api.graph.microsoft.com", false},         // child subdomain not ignored
-		{"evil.login.microsoftonline.com", false},  // prefix subdomain not ignored
-		{"", false},                                // empty host is never ignored
+		{"microsoft.com", false},                  // parent domain not ignored
+		{"api.graph.microsoft.com", false},        // child subdomain not ignored
+		{"evil.login.microsoftonline.com", false}, // prefix subdomain not ignored
+		{"", false},                               // empty host is never ignored
+		// Wildcard suffix tests
+		{"news.bbci.co.uk", true},                // subdomain matches *.bbci.co.uk
+		{"static.files.bbci.co.uk", true},        // deep subdomain matches *.bbci.co.uk
+		{"STATIC.FILES.BBCI.CO.UK", true},        // wildcard match is case-insensitive
+		{"bbci.co.uk", false},                    // apex itself does NOT match (wildcard, not exact)
+		{"notbbci.co.uk", false},                 // different domain not matched
+		{"evilbbci.co.uk", false},                // must not match bare suffix overlap
 	}
 	for _, c := range cases {
 		got := isIgnoredHost(c.host, ignored)

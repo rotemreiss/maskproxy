@@ -584,6 +584,12 @@ func rewriteCSPToken(token, targetLower, rootLower, proxyAddr string) string {
 // isIgnoredHost reports whether host (with or without port) is in the
 // ignoredHosts set.  The set keys are already lowercased at parse time.
 // A nil or empty set always returns false — no ignored hosts configured.
+//
+// Two kinds of entries are supported:
+//   - Exact hostname:  "login.microsoftonline.com" — stored as-is.
+//   - Wildcard suffix: "*.bbci.co.uk" — stored as ".bbci.co.uk" (dot prefix).
+//     Matches any hostname whose lowercased form ends with that suffix,
+//     e.g. "static.files.bbci.co.uk" and "news.bbci.co.uk" both match.
 func isIgnoredHost(host string, ignoredHosts map[string]bool) bool {
 	if len(ignoredHosts) == 0 {
 		return false
@@ -592,7 +598,17 @@ func isIgnoredHost(host string, ignoredHosts map[string]bool) bool {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	return ignoredHosts[strings.ToLower(host)]
+	host = strings.ToLower(host)
+	if ignoredHosts[host] {
+		return true
+	}
+	// Check wildcard suffix entries (stored with a leading dot, e.g. ".bbci.co.uk").
+	for entry := range ignoredHosts {
+		if strings.HasPrefix(entry, ".") && strings.HasSuffix(host, entry) {
+			return true
+		}
+	}
+	return false
 }
 
 // unmaskRequestString is the reverse of maskResponseString: it rewrites s from

@@ -40,7 +40,7 @@ maskproxy -target <host> [options]
 |------|-------------|
 | `-replace <pairs>` | Comma-separated `original:alias` pairs, e.g. `ctf:acme,ctfd:foo`. |
 | `-replace-file <path>` | File with one `original:alias` pair per line (`#` comments and blank lines ignored). Combined with `-replace`; CLI pairs win on conflict. |
-| `-ignore-host <hosts>` | Comma-separated upstream hostnames to exclude from all rewriting. Traffic still flows through the proxy but bodies and headers are passed through unchanged. Useful to protect hosts whose JS bundles contain strings that must not be touched (e.g. OAuth scope IDs). Repeatable. |
+| `-ignore-host <hosts>` | Comma-separated upstream hostnames to exclude from all rewriting. Supports wildcard prefix `*.domain.com` to match any subdomain. Traffic still flows through the proxy but bodies and headers are passed through unchanged. Useful to protect hosts whose JS bundles contain strings that must not be touched (e.g. OAuth scope IDs). Repeatable. |
 | `-cs` | Case-sensitive matching. Default is case-insensitive (`Microsoft`, `MICROSOFT`, `microsoft` all match). |
 
 ### Upstream connection
@@ -92,9 +92,9 @@ maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -insecure
 # Verbose logging to a file, loopback only, port 9001
 maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -verbose -log proxy.log -listen 127.0.0.1 -port 9001
 
-# Exclude an auth host from all rewriting (e.g. to protect MSAL JS bundles)
+# Exclude an auth host and a wildcard CDN domain from rewriting
 maskproxy -target microsoft.com -replace microsoft:msctf \
-  -ignore-host login.microsoftonline.com,graph.microsoft.com
+  -ignore-host login.microsoftonline.com -ignore-host "*.bbci.co.uk"
 ```
 
 | Direction | Example |

@@ -33,6 +33,7 @@ Options:
                            Combined with any -replace pairs (CLI pairs win on conflict).
   -ignore-host  <hosts>    Comma-separated list of upstream hostnames to exclude
                             from all proxy rewriting (repeatable).
+                            Wildcard prefix "*.domain.com" matches any subdomain.
                             Traffic to these hosts still flows through the proxy
                             but bodies and headers are passed through unchanged:
                             no host masking, no string replacement.
@@ -42,7 +43,7 @@ Options:
                             library-internal strings (e.g. OAuth scope IDs in
                             an MSAL bundle) that must not be touched.
                             Example: -ignore-host login.microsoftonline.com
-                                     -ignore-host graph.microsoft.com,cdn.msauth.net
+                                     -ignore-host "*.bbci.co.uk,cdn.example.com"
   -header       <h>        Add a header to every upstream request (repeatable).
                            Format: "Name: Value". Overrides same-named client headers.
                            Example: -header "X-Author: Rotem" -header "X-Token: abc"
@@ -149,7 +150,7 @@ func main() {
 	var headers headerFlag
 	flag.Var(&headers, "header", `Add a header to every upstream request (repeatable). Format: "Name: Value". Example: -header "X-Author: Rotem"`)
 	var ignoreHosts ignoreHostFlag
-	flag.Var(&ignoreHosts, "ignore-host", `Exclude hosts from all proxy rewriting (comma-separated, repeatable). Example: -ignore-host login.microsoftonline.com,graph.microsoft.com`)
+	flag.Var(&ignoreHosts, "ignore-host", `Exclude hosts from all proxy rewriting (comma-separated, repeatable). Wildcard "*.domain.com" matches any subdomain. Example: -ignore-host "*.bbci.co.uk,login.microsoftonline.com"`)
 
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -248,9 +249,14 @@ func main() {
 	}
 	if len(ignoredHostsMap) > 0 {
 		// Collect and sort for deterministic output.
+		// Dot-prefixed keys are wildcard entries — restore "*.domain" display form.
 		sorted := make([]string, 0, len(ignoredHostsMap))
 		for h := range ignoredHostsMap {
-			sorted = append(sorted, h)
+			if strings.HasPrefix(h, ".") {
+				sorted = append(sorted, "*"+h)
+			} else {
+				sorted = append(sorted, h)
+			}
 		}
 		sort.Strings(sorted)
 		logger.Printf("  → ignored hosts (no rewriting): %s", strings.Join(sorted, ", "))
@@ -375,12 +381,19 @@ func parseHeaders(raw []string) ([]headerPair, error) {
 }
 
 // parseIgnoreHosts converts the raw "-ignore-host" strings (each may be a
-// comma-separated list) into a lowercase hostname set for O(1) lookup.
+// comma-separated list) into a lowercase hostname set for O(1) exact lookup
+// and O(n) wildcard suffix lookup.
+//
+// Two entry kinds are accepted:
+//   - Exact hostname: "login.microsoftonline.com" — stored as-is (lowercased).
+//   - Wildcard:       "*.bbci.co.uk"              — stored as ".bbci.co.uk"
+//     (leading dot) so isIgnoredHost can match any subdomain via HasSuffix.
 //
 // Validation:
-//   - Each token must be a bare hostname or host:port — no scheme, no path.
+//   - Each token must be a bare hostname, "*.domain" wildcard, or host:port.
+//   - No scheme (e.g. https://), no path, no spaces.
 //   - Ports are stripped at parse time: "login.microsoft.com:443" → "login.microsoft.com".
-//   - Hostnames are lowercased so lookups are case-insensitive.
+//   - All keys are lowercased so lookups are case-insensitive.
 //   - Empty tokens (e.g. trailing commas) are silently skipped.
 func parseIgnoreHosts(raw []string) (map[string]bool, error) {
 	if len(raw) == 0 {
@@ -399,6 +412,13 @@ func parseIgnoreHosts(raw []string) (map[string]bool, error) {
 			}
 			if strings.ContainsAny(host, "/ ") {
 				return nil, fmt.Errorf("ignore-host %q must be a hostname (no path or spaces)", host)
+			}
+			// Handle wildcard prefix: "*.bbci.co.uk" → store as ".bbci.co.uk"
+			// isIgnoredHost detects dot-prefixed entries and uses HasSuffix matching.
+			if strings.HasPrefix(host, "*.") {
+				suffix := host[1:] // strip "*", keep leading "."
+				result[strings.ToLower(suffix)] = true
+				continue
 			}
 			// Strip port so that "host:443" and "host" both normalise to "host".
 			if h, _, err := net.SplitHostPort(host); err == nil {
