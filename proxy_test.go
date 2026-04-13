@@ -668,3 +668,221 @@ func TestHEADRequestNoGzipError(t *testing.T) {
 	}
 }
 
+// ---- rewriteRootRelativePaths unit tests ----
+
+// TestRewriteRootRelativePathsHTML verifies that root-relative paths in common
+// HTML attributes are prefixed with the /__sd__/<subHost> routing path so that
+// browsers resolve them against the correct upstream subdomain.
+func TestRewriteRootRelativePathsHTML(t *testing.T) {
+	sub := "copilot.microsoft.com"
+	pfx := "/__sd__/" + sub
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "href",
+			input: `<link href="/static/app.css">`,
+			want:  `<link href="` + pfx + `/static/app.css">`,
+		},
+		{
+			name:  "src",
+			input: `<script src="/assets/vendor.js"></script>`,
+			want:  `<script src="` + pfx + `/assets/vendor.js"></script>`,
+		},
+		{
+			name:  "action form",
+			input: `<form action="/submit">`,
+			want:  `<form action="` + pfx + `/submit">`,
+		},
+		{
+			name:  "data-src",
+			input: `<img data-src="/img/lazy.jpg">`,
+			want:  `<img data-src="` + pfx + `/img/lazy.jpg">`,
+		},
+		{
+			name:  "manifest",
+			input: `<link rel="manifest" manifest="/app.webmanifest">`,
+			want:  `<link rel="manifest" manifest="` + pfx + `/app.webmanifest">`,
+		},
+		{
+			name:  "already /__sd__/ — leave unchanged",
+			input: `<img src="/__sd__/other.microsoft.com/img/logo.png">`,
+			want:  `<img src="/__sd__/other.microsoft.com/img/logo.png">`,
+		},
+		{
+			name:  "protocol-relative — leave unchanged",
+			input: `<img src="//cdn.microsoft.com/img/logo.png">`,
+			want:  `<img src="//cdn.microsoft.com/img/logo.png">`,
+		},
+		{
+			name:  "absolute https — leave unchanged",
+			input: `<a href="https://microsoft.com/page">link</a>`,
+			want:  `<a href="https://microsoft.com/page">link</a>`,
+		},
+		{
+			name:  "fragment only — leave unchanged (no leading slash in value)",
+			input: `<a href="#section">jump</a>`,
+			want:  `<a href="#section">jump</a>`,
+		},
+		{
+			name:  "base href root — rewrite",
+			input: `<base href="/">`,
+			want:  `<base href="` + pfx + `/">`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rewriteRootRelativePaths(tc.input, sub)
+			if got != tc.want {
+				t.Errorf("got  %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRewriteRootRelativePathsSrcset verifies that each URL in a multi-entry
+// srcset value is individually prefixed with the /__sd__/ route.
+func TestRewriteRootRelativePathsSrcset(t *testing.T) {
+	sub := "copilot.microsoft.com"
+	pfx := "/__sd__/" + sub
+
+	input := `<img srcset="/img/small.jpg 300w, /img/large.jpg 1000w" src="/img/small.jpg">`
+	got := rewriteRootRelativePaths(input, sub)
+
+	wants := []string{
+		`srcset="` + pfx + `/img/small.jpg 300w,` + ` ` + pfx + `/img/large.jpg 1000w"`,
+		`src="` + pfx + `/img/small.jpg"`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("expected output to contain %q\ngot: %q", w, got)
+		}
+	}
+}
+
+// TestRewriteRootRelativePathsCSS verifies that root-relative paths inside CSS
+// url() expressions are prefixed with the /__sd__/ route.
+func TestRewriteRootRelativePathsCSS(t *testing.T) {
+	sub := "copilot.microsoft.com"
+	pfx := "/__sd__/" + sub
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "url with double quotes",
+			input: `background: url("/img/bg.png");`,
+			want:  `background: url("` + pfx + `/img/bg.png");`,
+		},
+		{
+			name:  "url without quotes",
+			input: `background: url(/img/bg.png);`,
+			want:  `background: url(` + pfx + `/img/bg.png);`,
+		},
+		{
+			name:  "absolute url — leave unchanged",
+			input: `background: url(https://cdn.microsoft.com/img/bg.png);`,
+			want:  `background: url(https://cdn.microsoft.com/img/bg.png);`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rewriteRootRelativePaths(tc.input, sub)
+			if got != tc.want {
+				t.Errorf("got  %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSubdomainRootRelativeIntegration verifies the full proxy pipeline:
+// a response from a subdomain host containing root-relative asset paths
+// must have those paths rewritten to /__sd__/<subHost>/... in the proxied HTML.
+func TestSubdomainRootRelativeIntegration(t *testing.T) {
+	const subHost = "sub.example.com"
+	const rootHost = "example.com"
+
+	// Upstream server that serves different content depending on the Host header.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		switch r.Host {
+		case subHost:
+			fmt.Fprint(w, `<link href="/static/app.css"><script src="/js/main.js"></script>`)
+		default:
+			fmt.Fprint(w, `<a href="/">root</a>`)
+		}
+	}))
+	defer upstream.Close()
+
+	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
+
+	// We need a custom transport that routes all connections to the test upstream
+	// regardless of the requested hostname (so /__sd__/sub.example.com/ actually
+	// reaches our test server instead of trying DNS on the real Internet).
+	rt := &fixedHostTransport{upstream: upstream}
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(rootHost, "http", rep, false, "localhost:9999", false, 0, testLogger())
+	// Override the transport so subdomain requests hit the test upstream.
+	proxy.Transport = rt
+	_ = upstreamHost // used via rt
+
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/__sd__/" + subHost + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	got := string(body)
+
+	wantHref := `href="/__sd__/` + subHost + `/static/app.css"`
+	wantSrc := `src="/__sd__/` + subHost + `/js/main.js"`
+	if !strings.Contains(got, wantHref) {
+		t.Errorf("missing rewritten href in body\nwant substring: %q\ngot: %q", wantHref, got)
+	}
+	if !strings.Contains(got, wantSrc) {
+		t.Errorf("missing rewritten src in body\nwant substring: %q\ngot: %q", wantSrc, got)
+	}
+}
+
+// fixedHostTransport is a test RoundTripper that routes every request to a
+// fixed httptest.Server, ignoring the request's Host/URL.Host.  This lets
+// integration tests exercise subdomain routing without real DNS lookups.
+type fixedHostTransport struct {
+	upstream *httptest.Server
+}
+
+func (f *fixedHostTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	origHost := req.URL.Host
+	// Clone the request so we can mutate it safely.
+	clone := req.Clone(req.Context())
+	// Point all requests at the test upstream's address while keeping the
+	// Host header intact so the upstream handler can differentiate by r.Host.
+	clone.URL.Scheme = "http"
+	clone.URL.Host = strings.TrimPrefix(f.upstream.URL, "http://")
+	resp, err := http.DefaultTransport.RoundTrip(clone)
+	if resp != nil {
+		// Restore the original subdomain hostname on resp.Request so that
+		// modifyResponse in the proxy sees the intended subdomain host
+		// (e.g. "sub.example.com") rather than the test server's IP:port.
+		// Without this, rewriteRootRelativePaths would be called with the
+		// wrong host and the test assertions would fail.
+		rr := *resp.Request
+		ru := *resp.Request.URL
+		ru.Host = origHost
+		rr.URL = &ru
+		resp.Request = &rr
+	}
+	return resp, err
+}
+

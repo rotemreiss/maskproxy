@@ -25,6 +25,26 @@ var absURLRe = regexp.MustCompile(`(?:https?:)?//[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-z
 // is not corrupted into "/__sd__/api.localhost:8081/".
 var subdomainPathRe = regexp.MustCompile(`/__sd__/[^\s"'<>\x00-\x1F]+`)
 
+// rootRelativeAttrRe matches HTML attribute values that are root-relative paths
+// (start with "/" but not "//" or "/__sd__/").
+// Group 1 = attribute name + "=" + opening quote (e.g. `href="`).
+// Group 2 = the root-relative path (e.g. `/static/app.js`).
+// Attributes covered: href, src, action, formaction, data-*, manifest, poster.
+var rootRelativeAttrRe = regexp.MustCompile(
+	`(?i)((?:href|src|action|formaction|data-[a-zA-Z-]+|manifest|poster)\s*=\s*["'])(/[^"'<>\s]*)`,
+)
+
+// srcsetAttrRe captures the opening quote+prefix and raw value of a srcset
+// attribute for special multi-URL processing.
+// Group 1 = `srcset="` (or single-quoted equivalent).
+// Group 2 = the comma-separated list of URL+descriptor entries.
+var srcsetAttrRe = regexp.MustCompile(`(?i)(srcset\s*=\s*["'])([^"']*)`)
+
+// rootRelativeCSSRe matches CSS url() values that are root-relative paths.
+// Group 1 = `url(` with optional opening quote.
+// Group 2 = the root-relative path.
+var rootRelativeCSSRe = regexp.MustCompile(`(?i)(url\s*\(\s*["']?)(/[^"')<>\s]*)`)
+
 // maxBodyRewrite is the maximum response body size (in bytes) that will be
 // buffered and rewritten. Responses larger than this are forwarded unchanged to
 // prevent out-of-memory conditions when proxying large file downloads.
@@ -335,6 +355,92 @@ func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe
 	for _, e := range sdSaved {
 		s = strings.Replace(s, e.ph, e.orig, 1)
 	}
+
+	return s
+}
+
+// rewriteRootRelativePaths prepends "/__sd__/<subHost>" to every root-relative
+// path in s so that browsers fetch subdomain resources through the proxy's
+// routing mechanism rather than against the proxy root.
+//
+// Background: when a subdomain page (e.g. copilot.microsoft.com) is served at
+//
+//	http://localhost:PORT/__sd__/copilot.microsoft.com/
+//
+// its root-relative resource references like href="/static/app.js" resolve to
+//
+//	http://localhost:PORT/static/app.js   ← routes to the main target, not the subhost
+//
+// instead of the intended
+//
+//	http://localhost:PORT/__sd__/copilot.microsoft.com/static/app.js
+//
+// This function corrects that for HTML attribute values (href, src, action,
+// formaction, data-*, manifest, poster), srcset entries, and CSS url() expressions.
+//
+// Call order matters:
+//   - AFTER maskResponseString  so absolute subdomain URLs are already routed to /__sd__/
+//   - BEFORE withExternalURLsProtected so the new /__sd__/ paths are shielded from
+//     user string replacements (subdomainPathRe in withExternalURLsProtected handles this)
+//
+// subHost is the unmasked upstream hostname (e.g. "copilot.microsoft.com").
+func rewriteRootRelativePaths(s, subHost string) string {
+	pfx := subdomainPrefix + subHost // e.g. "/__sd__/copilot.microsoft.com"
+
+	// rewritePath prepends pfx unless the path is already routed (/__sd__/) or
+	// protocol-relative (//cdn.example.com/...) — those are handled elsewhere.
+	rewritePath := func(path string) string {
+		if strings.HasPrefix(path, subdomainPrefix) || strings.HasPrefix(path, "//") {
+			return path
+		}
+		return pfx + path
+	}
+
+	// Rewrite href, src, action, formaction, data-*, manifest, poster values.
+	s = rootRelativeAttrRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := rootRelativeAttrRe.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		return sub[1] + rewritePath(sub[2])
+	})
+
+	// Rewrite srcset values: comma-separated "url [descriptor], url [descriptor]" lists.
+	// Each entry may begin with a root-relative URL that needs rewriting.
+	s = srcsetAttrRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := srcsetAttrRe.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		// sub[1] = `srcset="`, sub[2] = the raw comma-separated value
+		entries := strings.Split(sub[2], ",")
+		for i, entry := range entries {
+			// Each entry is optionally-spaced "url [descriptor]".
+			// Preserve any leading whitespace (e.g. after a comma).
+			trimmed := strings.TrimLeft(entry, " \t")
+			if !strings.HasPrefix(trimmed, "/") {
+				continue
+			}
+			leading := entry[:len(entry)-len(trimmed)]
+			// Split URL from optional descriptor (e.g. "300w", "2x").
+			space := strings.IndexByte(trimmed, ' ')
+			if space < 0 {
+				entries[i] = leading + rewritePath(trimmed)
+			} else {
+				entries[i] = leading + rewritePath(trimmed[:space]) + trimmed[space:]
+			}
+		}
+		return sub[1] + strings.Join(entries, ",")
+	})
+
+	// Rewrite CSS url() expressions.
+	s = rootRelativeCSSRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := rootRelativeCSSRe.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		return sub[1] + rewritePath(sub[2])
+	})
 
 	return s
 }
@@ -658,7 +764,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		}
 		resp.Body.Close()
 
-		// Rewrite body in two passes — ORDER IS CRITICAL:
+		// Rewrite body in three passes — ORDER IS CRITICAL:
 		//
 		//   Pass 1 — Host masking (upstream host → proxy address):
 		//     "https://ctf.io/page" → "http://localhost:8080/page"
@@ -666,12 +772,29 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		//     running user replacements first turns "ctf.io" → "acme.io", and we
 		//     can no longer match the upstream hostname to replace it with the proxy.
 		//
-		//   Pass 2 — User replacements (original → alias):
+		//   Pass 2 — Root-relative path prefixing (subdomain responses only):
+		//     href="/static/app.js" → href="/__sd__/copilot.microsoft.com/static/app.js"
+		//     When the browser is at http://localhost:PORT/__sd__/copilot.microsoft.com/,
+		//     root-relative paths resolve against http://localhost:PORT/ (the proxy root),
+		//     routing them to the main target instead of the subdomain.  Prefixing with
+		//     the /__sd__/ routing path fixes the browser's base-URL resolution.
+		//     Must run AFTER pass 1 (absolute URLs already handled) and BEFORE pass 3
+		//     (so the new /__sd__/ paths are shielded from user string replacements).
+		//
+		//   Pass 3 — User replacements (original → alias):
 		//     "ctf" → "acme",  "ctfd" → "foo"
 		//
 		// We also count how many user-substitutions happened so the log line can
 		// report "[N replaced]" even in non-verbose mode.
 		rewritten := maskResponseString(string(raw), targetHost, rootDomain, proxyAddr, subdomainRe)
+
+		// Pass 2: if this response came from a subdomain host (not the main target),
+		// rewrite root-relative paths so browsers resolve them against the subdomain
+		// /__sd__/ route rather than the proxy root.
+		if reqHost := resp.Request.URL.Host; !strings.EqualFold(reqHost, targetHost) && reqHost != "" {
+			rewritten = rewriteRootRelativePaths(rewritten, reqHost)
+		}
+
 		var replaceCount int
 		rewritten = withExternalURLsProtected(rewritten, "http://"+proxyAddr, func(s string) string {
 			var n int
