@@ -229,3 +229,27 @@ for i := 0; i < b.N; i++ {
 _ = rep.ToOriginal(body)
 }
 }
+
+// TestReplacerNoPairs verifies that a Replacer with no pairs is a no-op
+// and that ToOriginalDiff/ToAliasDiff return zero counts.
+func TestReplacerNoPairs(t *testing.T) {
+	rep, err := NewReplacer("", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := rep.ToOriginal("hello ctf world"); s != "hello ctf world" {
+		t.Errorf("ToOriginal with no pairs should be no-op, got %q", s)
+	}
+	if s := rep.ToAlias("hello ctf world"); s != "hello ctf world" {
+		t.Errorf("ToAlias with no pairs should be no-op, got %q", s)
+	}
+	if s, n := rep.ToOriginalDiff("hello ctf world"); s != "hello ctf world" || n != 0 {
+		t.Errorf("ToOriginalDiff with no pairs should return (s,0), got (%q, %d)", s, n)
+	}
+	if s, n := rep.ToAliasDiff("hello ctf world"); s != "hello ctf world" || n != 0 {
+		t.Errorf("ToAliasDiff with no pairs should return (s,0), got (%q, %d)", s, n)
+	}
+	if rep.HasPairs() {
+		t.Error("HasPairs should be false when no pairs configured")
+	}
+}
