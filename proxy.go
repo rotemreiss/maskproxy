@@ -145,6 +145,18 @@ var headersStrip = map[string]bool{
 	"Public-Key-Pins-Report-Only": true,
 	"Expect-CT":                   true,
 
+	// Alt-Svc: advertises alternative service endpoints (HTTP/3, h2c, etc.).
+	// If forwarded, the browser would attempt to connect directly to the upstream
+	// host/port using the alternative protocol, bypassing the proxy entirely on
+	// subsequent requests.  Strip it unconditionally.
+	"Alt-Svc": true,
+
+	// X-Frame-Options: DENY/SAMEORIGIN prevents the proxy from embedding
+	// subdomain pages in iframes within the proxy context (e.g. /__sd__/host/
+	// framed inside the main proxy page). The proxy already controls the framing
+	// context, so this restriction is counterproductive.
+	"X-Frame-Options": true,
+
 	// Report-To and NEL instruct the browser to send error/network reports to
 	// upstream collection endpoints, leaking real hostnames and traffic details.
 	"Report-To":                     true,

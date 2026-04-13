@@ -2708,3 +2708,59 @@ if v := resp.Header.Get("Via"); v != "" {
 t.Errorf("Via not stripped from response: %q", v)
 }
 }
+
+// TestAltSvcStripped verifies Alt-Svc is removed.  If forwarded, the browser
+// would connect directly to the upstream host using HTTP/3 or another protocol,
+// bypassing the proxy entirely on subsequent requests.
+func TestAltSvcStripped(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Alt-Svc", "h3=:443; ma=86400")
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := http.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if v := resp.Header.Get("Alt-Svc"); v != "" {
+		t.Errorf("Alt-Svc not stripped: %q", v)
+	}
+}
+
+// TestXFrameOptionsStripped verifies X-Frame-Options is removed.  DENY or
+// SAMEORIGIN would prevent the proxy from embedding subdomain pages in iframes
+// within the proxy context.
+func TestXFrameOptionsStripped(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html></html>")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := http.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if v := resp.Header.Get("X-Frame-Options"); v != "" {
+		t.Errorf("X-Frame-Options not stripped: %q", v)
+	}
+}
