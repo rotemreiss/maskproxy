@@ -599,17 +599,39 @@ func rewriteCSPToken(token, targetLower, rootLower, proxyAddr string) string {
 	}
 }
 
-// isIgnoredHost reports whether host (with or without port) is in the
-// ignoredHosts set.  The set keys are already lowercased at parse time.
-// A nil or empty set always returns false — no ignored hosts configured.
+// ignoredHostSet holds two disjoint sets for efficient ignored-host lookup:
+//   - exact: O(1) map lookup for precise hostnames
+//   - wildcards: pre-built slice of ".suffix" strings for O(k) HasSuffix scan
+//     where k is the number of wildcard entries (typically very small).
 //
-// Two kinds of entries are supported:
-//   - Exact hostname:  "login.microsoftonline.com" — stored as-is.
-//   - Wildcard suffix: "*.bbci.co.uk" — stored as ".bbci.co.uk" (dot prefix).
-//     Matches any hostname whose lowercased form ends with that suffix,
-//     e.g. "static.files.bbci.co.uk" and "news.bbci.co.uk" both match.
-func isIgnoredHost(host string, ignoredHosts map[string]bool) bool {
-	if len(ignoredHosts) == 0 {
+// This avoids iterating the whole map on every request, as the old
+// map[string]bool implementation did when checking wildcard entries.
+type ignoredHostSet struct {
+	exact     map[string]bool
+	wildcards []string // each entry is a ".suffix" (leading dot)
+}
+
+// newIgnoredHostSet converts the flat map produced by parseIgnoreHosts into a
+// typed set with separate exact and wildcard buckets.
+func newIgnoredHostSet(m map[string]bool) *ignoredHostSet {
+	if len(m) == 0 {
+		return nil
+	}
+	s := &ignoredHostSet{exact: make(map[string]bool, len(m))}
+	for k := range m {
+		if strings.HasPrefix(k, ".") {
+			s.wildcards = append(s.wildcards, k)
+		} else {
+			s.exact[k] = true
+		}
+	}
+	return s
+}
+
+// contains reports whether host (with or without port) matches an exact entry
+// or any wildcard suffix in the set.
+func (s *ignoredHostSet) contains(host string) bool {
+	if s == nil {
 		return false
 	}
 	// Strip port if present (e.g. "login.microsoftonline.com:443" → "login.microsoftonline.com").
@@ -617,16 +639,22 @@ func isIgnoredHost(host string, ignoredHosts map[string]bool) bool {
 		host = h
 	}
 	host = strings.ToLower(host)
-	if ignoredHosts[host] {
+	if s.exact[host] {
 		return true
 	}
-	// Check wildcard suffix entries (stored with a leading dot, e.g. ".bbci.co.uk").
-	for entry := range ignoredHosts {
-		if strings.HasPrefix(entry, ".") && strings.HasSuffix(host, entry) {
+	// Wildcard suffix scan: O(k) where k = number of wildcard entries (typically ≤ 5).
+	for _, suffix := range s.wildcards {
+		if strings.HasSuffix(host, suffix) {
 			return true
 		}
 	}
 	return false
+}
+
+// isIgnoredHost is a convenience wrapper for the old map[string]bool API,
+// used by callers that still pass the flat map directly.
+func isIgnoredHost(host string, ignoredHosts map[string]bool) bool {
+	return newIgnoredHostSet(ignoredHosts).contains(host)
 }
 
 // unmaskRequestString is the reverse of maskResponseString: it rewrites s from
@@ -864,6 +892,9 @@ func (c *wsLoggingConn) Close() error { return c.rwc.Close() }
 // logger handles all per-request and startup logging; pass a Logger constructed
 // with NewLogger.
 func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger, extraHeaders []headerPair, ignoredHosts map[string]bool) *httputil.ReverseProxy {
+	// Convert the flat map into a typed set with separate exact/wildcard buckets
+	// so that isIgnoredHost does not pay O(n) map iteration for wildcard matching.
+	ignored := newIgnoredHostSet(ignoredHosts)
 	target := &url.URL{Scheme: scheme, Host: targetHost}
 
 	// Build a single regex that matches the scheme+host prefix of any subdomain
@@ -985,7 +1016,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 				outboundHostForPath = rest
 			}
 		}
-		if rep.HasPairs() && !isIgnoredHost(outboundHostForPath, ignoredHosts) {
+		if rep.HasPairs() && !ignored.contains(outboundHostForPath) {
 			req.URL.Path = rep.ToOriginal(req.URL.Path)
 			if req.URL.RawPath != "" {
 				req.URL.RawPath = rep.ToOriginal(req.URL.RawPath)
@@ -1050,7 +1081,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// through unchanged so that functional strings (OAuth scopes, tenant IDs,
 		// etc.) are not corrupted by the user-defined replacement pairs.
 		outboundHost := req.Host
-		if !isIgnoredHost(outboundHost, ignoredHosts) {
+		if !ignored.contains(outboundHost) {
 			for key, vals := range req.Header {
 				for i, v := range vals {
 					if rep.HasPairs() {
@@ -1070,7 +1101,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			if err == nil {
 				rewritten := string(body)
 				replaceCount := 0
-				if !isIgnoredHost(outboundHost, ignoredHosts) {
+				if !ignored.contains(outboundHost) {
 					if rep.HasPairs() {
 						rewritten, replaceCount = rep.ToOriginalDiff(rewritten)
 					}
@@ -1184,7 +1215,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// skipped.  Traffic flows through untouched so that functional strings
 		// embedded in the response (OAuth scopes, tenant IDs, library internals)
 		// are never corrupted by user-defined replacement pairs.
-		if isIgnoredHost(resp.Request.URL.Host, ignoredHosts) {
+		if ignored.contains(resp.Request.URL.Host) {
 			logger.LogResponse(resp, "", start, 0)
 			return nil
 		}
