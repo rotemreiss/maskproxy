@@ -32,6 +32,8 @@ Options:
   -replace     <pairs>  Comma-separated original:alias pairs (e.g. ctf:acme,ctfd:foo)
   -insecure             Connect to upstream over plain HTTP instead of HTTPS
   -skip-verify          Skip TLS certificate verification (self-signed certs)
+  -verbose              Log every request/response with full headers and body preview
+  -log         <path>   Append log output to file in addition to stderr
   -ci                   Case-insensitive string replacement
   -exact-domain         Only mask the exact target host, not subdomains
   -port        <n>      Local port (default: 8080)
@@ -49,6 +51,9 @@ maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -skip-verify
 
 # Plain HTTP upstream
 maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -insecure
+
+# Show full request/response details and save to a log file
+maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -verbose -log proxy.log
 ```
 
 | Direction | What happens |

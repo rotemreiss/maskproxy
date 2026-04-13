@@ -4,7 +4,6 @@ import (
 	"compress/gzip"
 	"crypto/tls"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -12,6 +11,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // absURLRe matches absolute and protocol-relative URLs (used to protect
@@ -322,7 +323,10 @@ func unmaskRequestString(s, targetHost, scheme, proxyAddr string) string {
 // root domain (e.g. api.ynet.co.il, cdn.ynet.co.il) is also rewritten to the
 // proxy address so no subdomain leaks to the client.  Set exactDomain=true to
 // restrict masking to the exact target host only.
-func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool) *httputil.ReverseProxy {
+//
+// logger handles all per-request and startup logging; pass a Logger constructed
+// with NewLogger.
+func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, logger *Logger) *httputil.ReverseProxy {
 	target := &url.URL{Scheme: scheme, Host: targetHost}
 
 	// Build a single regex that matches the scheme+host prefix of any subdomain
@@ -361,8 +365,13 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if insecure {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // intentional for CTF
-		log.Printf("maskproxy: WARNING — TLS certificate verification disabled (-skip-verify)")
+		logger.Printf("maskproxy: WARNING — TLS certificate verification disabled (-skip-verify)")
 	}
+
+	// reqTimes stores the start time recorded in the director so that
+	// modifyResponse can compute round-trip latency.  sync.Map is used because
+	// director and modifyResponse run concurrently for different requests.
+	var reqTimes sync.Map // key: *http.Request → value: time.Time
 
 	director := func(req *http.Request) {
 		req.URL.Scheme = target.Scheme
@@ -434,7 +443,15 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 				rewritten = unmaskRequestString(rewritten, outboundHost, scheme, proxyAddr)
 				req.Body = io.NopCloser(strings.NewReader(rewritten))
 				req.ContentLength = int64(len(rewritten))
+				// Log request now that body is fully rewritten.  The body snapshot
+				// is only materialised in verbose mode (LogRequest checks internally).
+				start := logger.LogRequest(req, rewritten)
+				reqTimes.Store(req, start)
 			}
+		} else {
+			// Bodyless request (GET, HEAD, etc.) — still log + record start time.
+			start := logger.LogRequest(req, "")
+			reqTimes.Store(req, start)
 		}
 
 		// Limit accepted encodings to what we can transparently decompress.
@@ -448,6 +465,13 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	}
 
 	modifyResponse := func(resp *http.Response) error {
+		// Retrieve the start time stored by the director for this request.
+		// Use a zero time as fallback if somehow it wasn't stored.
+		var start time.Time
+		if v, ok := reqTimes.LoadAndDelete(resp.Request); ok {
+			start = v.(time.Time)
+		}
+
 		// ── Phase 1: header rewrites — run on EVERY response ─────────────────
 		// Redirects (301/302/307/308) and non-text assets can carry headers that
 		// leak the upstream hostname.  These must be rewritten unconditionally
@@ -479,6 +503,8 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// byte-level replacement would corrupt them.
 		contentType := resp.Header.Get("Content-Type")
 		if !isTextContent(contentType) {
+			// Log before returning — no body snapshot for binary content.
+			logger.LogResponse(resp, "", start)
 			return nil
 		}
 
@@ -488,7 +514,8 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		if isGzip {
 			gz, err := gzip.NewReader(resp.Body)
 			if err != nil {
-				log.Printf("maskproxy: failed to decode gzip response: %v", err)
+				logger.Printf("maskproxy: failed to decode gzip response: %v", err)
+				logger.LogResponse(resp, "", start)
 				return nil
 			}
 			defer gz.Close()
@@ -507,7 +534,8 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// For gzip, the compressed stream is already partially consumed and cannot
 		// be reconstructed; we forward the decompressed portion and log a warning.
 		if int64(len(raw)) > maxBodyRewrite {
-			log.Printf("maskproxy: response body exceeds %d bytes; skipping rewrite", maxBodyRewrite)
+			logger.Printf("maskproxy: response body exceeds %d bytes; skipping rewrite", maxBodyRewrite)
+			logger.LogResponse(resp, "", start)
 			if isGzip {
 				resp.Body = io.NopCloser(strings.NewReader(string(raw)))
 			} else {
@@ -536,11 +564,14 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		resp.ContentLength = int64(len(rewritten))
 		resp.Header.Set("Content-Length", strconv.FormatInt(int64(len(rewritten)), 10))
 
+		logger.LogResponse(resp, rewritten, start)
 		return nil
 	}
 
 	errorHandler := func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("maskproxy: upstream error for %s %s: %v", r.Method, r.URL, err)
+		// Clean up the timing entry if the request never reached modifyResponse.
+		reqTimes.Delete(r)
+		logger.Printf("maskproxy: upstream error for %s %s: %v", r.Method, r.URL, err)
 		http.Error(w, "Bad Gateway: "+err.Error(), http.StatusBadGateway)
 	}
 

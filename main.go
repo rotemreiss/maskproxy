@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -33,6 +32,11 @@ Options:
                          target's root domain (api.*, cdn.*, auth.*, …) so
                          no subdomain leaks to the client.  Use -exact-domain
                          to restrict masking to the literal -target host only.
+  -verbose               Log every request and response with full headers and
+                         a body preview (first 4 KiB).  Sensitive headers
+                         (Authorization, Cookie, Set-Cookie) are redacted.
+  -log         <path>    Append all log output to <path> in addition to stderr.
+                         Works with both normal and -verbose mode.
   -port        <n>       Local port to listen on (default: 8080).
   -listen      <addr>    Local listen address (default: 0.0.0.0).
                          Use "127.0.0.1" to restrict to loopback only.
@@ -46,6 +50,9 @@ Examples:
 
   # Connect to an HTTP-only upstream
   maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -insecure
+
+  # Show full request/response details and persist to a log file
+  maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -verbose -log proxy.log
 
   # Listen only on loopback, port 9090
   maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -port 9090 -listen 127.0.0.1
@@ -65,6 +72,8 @@ func main() {
 	skipVerify := flag.Bool("skip-verify", false, "Skip TLS certificate verification (for self-signed certs)")
 	ci := flag.Bool("ci", false, "Case-insensitive string replacement (e.g. matches 'Microsoft' and 'MICROSOFT')")
 	exactDomain := flag.Bool("exact-domain", false, "Only mask the exact target host, not subdomains")
+	verbose := flag.Bool("verbose", false, "Log full request/response headers and body preview")
+	logFile := flag.String("log", "", "Append log output to this file in addition to stderr")
 	port := flag.Int("port", 8080, "Local port to listen on")
 	listen := flag.String("listen", "0.0.0.0", "Local listen address")
 
@@ -96,30 +105,43 @@ func main() {
 		os.Exit(1)
 	}
 
+	logger, closeLog, err := NewLogger(*verbose, *logFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer closeLog()
+
 	scheme := "https"
 	if *insecure {
 		scheme = "http"
 	}
 
-	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, proxyAddr(scheme, *listen, *port), *exactDomain)
+	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, proxyAddr(scheme, *listen, *port), *exactDomain, logger)
 
 	addr := fmt.Sprintf("%s:%d", *listen, *port)
-	log.Printf("maskproxy listening on http://%s", addr)
-	log.Printf("  → upstream: %s://%s", scheme, *target)
+	logger.Printf("maskproxy listening on http://%s", addr)
+	logger.Printf("  → upstream: %s://%s", scheme, *target)
 	if rep.HasPairs() {
-		log.Printf("  → replacements: %s", *replace)
+		logger.Printf("  → replacements: %s", *replace)
 	}
 	if *exactDomain {
-		log.Printf("  → subdomain masking: disabled (-exact-domain)")
+		logger.Printf("  → subdomain masking: disabled (-exact-domain)")
 	} else {
 		root := computeRootDomain(*target)
 		if root != *target {
-			log.Printf("  → subdomain masking: *.%s → proxy", root)
+			logger.Printf("  → subdomain masking: *.%s → proxy", root)
 		}
+	}
+	if *verbose {
+		logger.Printf("  → verbose logging enabled")
+	}
+	if *logFile != "" {
+		logger.Printf("  → log file: %s", *logFile)
 	}
 
 	if err := http.ListenAndServe(addr, proxy); err != nil {
-		log.Fatalf("maskproxy: %v", err)
+		logger.Fatal("maskproxy: %v", err)
 	}
 }
 
