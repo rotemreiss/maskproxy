@@ -1367,8 +1367,19 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		}
 
 		// Decompress gzip before string replacement.
+		// We force Accept-Encoding: gzip, identity on all requests, so upstreams
+		// should not send other encodings. But CDNs sometimes ignore the header
+		// and respond with br (Brotli) or zstd. If we can't decode the encoding,
+		// skip body rewriting entirely to avoid corrupting the compressed bytes.
 		var bodyReader io.Reader = resp.Body
-		isGzip := strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip")
+		ce := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+		isGzip := ce == "gzip"
+		if !isGzip && ce != "" && ce != "identity" {
+			// Unknown encoding — forward body unchanged and skip rewriting.
+			logger.Printf("maskproxy: skipping body rewrite: unsupported Content-Encoding %q", ce)
+			logger.LogResponse(resp, "", start, 0)
+			return nil
+		}
 		if isGzip {
 			gz, err := gzip.NewReader(resp.Body)
 			if err != nil {

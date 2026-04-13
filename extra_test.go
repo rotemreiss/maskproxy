@@ -2057,3 +2057,39 @@ func TestSubdomainRedirectLocationRewrite(t *testing.T) {
 		t.Errorf("Location header = %q; want %q", loc, expected)
 	}
 }
+
+// TestUnknownContentEncodingSkipsRewrite verifies that when an upstream sends
+// a response with an unsupported Content-Encoding (e.g., br, zstd), the proxy
+// forwards the body unchanged rather than applying string replacement to the
+// compressed binary bytes, which would corrupt the response.
+func TestUnknownContentEncodingSkipsRewrite(t *testing.T) {
+	const fakeCompressed = "\x1b\x28\x00\x00\x18\x00\x00\x00\x00\x00" // fake brotli-like bytes
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Encoding", "br")
+		w.Write([]byte(fakeCompressed))
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("ctf:acme", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	// Body must be forwarded byte-for-byte unchanged.
+	if string(body) != fakeCompressed {
+		t.Errorf("body was modified: got %d bytes, want %d bytes", len(body), len(fakeCompressed))
+	}
+	// Content-Encoding must still be present.
+	if ce := resp.Header.Get("Content-Encoding"); ce != "br" {
+		t.Errorf("Content-Encoding = %q; want %q", ce, "br")
+	}
+}
