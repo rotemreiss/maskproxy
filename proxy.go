@@ -114,12 +114,19 @@ var manifestRootRelativeRe = regexp.MustCompile(`("(?:scope|start_url)"\s*:\s*)"
 // JSON-string-value rewriting.
 var importMapRe = regexp.MustCompile(`(?si)<script[^>]+type\s*=\s*["']importmap["'][^>]*>(.*?)</script>`)
 
+// speculationRulesRe matches an entire <script type="speculationrules">…</script>
+// block.  Speculation-rules JSON contains URL lists (e.g. "/page1") that the
+// browser prefetches/prerenders.  Root-relative values resolve against the proxy
+// root on subdomain pages, causing prefetches to hit the wrong upstream.  We
+// rewrite them with the same JSON-string-value approach as importmap.
+var speculationRulesRe = regexp.MustCompile(`(?si)<script[^>]+type\s*=\s*["']speculationrules["'][^>]*>(.*?)</script>`)
+
 // importMapValueRe matches JSON string values that are root-relative paths inside
-// an importmap script block (after the block has been isolated by importMapRe).
-// Group 1 = the opening double-quote.
-// Group 2 = the root-relative path.
-// Group 3 = the closing double-quote.
+// an importmap or speculationrules script block (after the block has been isolated).
+// Group 1 = the root-relative path.
 var importMapValueRe = regexp.MustCompile(`"(/[^"]*)"`)
+
+// linkHeaderRe matches root-relative URLs inside Link header angle brackets.
 // Format: `</path/to/resource>; rel=preload`
 // Group 1 = the root-relative path (the part between < and >).
 var linkHeaderRe = regexp.MustCompile(`<(/[^/][^>]*)>`)
@@ -798,27 +805,31 @@ func rewriteRootRelativePaths(s, subHost string) string {
 	// For subdomain pages, the JSON string values are root-relative paths that
 	// resolve against the browser's base URL (proxy root, not the subdomain route).
 	// We find each importmap block and rewrite JSON string values that start with "/".
-	s = importMapRe.ReplaceAllStringFunc(s, func(m string) string {
-		sub := importMapRe.FindStringSubmatch(m)
-		if len(sub) < 2 {
-			return m
-		}
-		inner := sub[1]
-		rewrittenInner := importMapValueRe.ReplaceAllStringFunc(inner, func(jv string) string {
-			// jv is a full JSON string including quotes, e.g. `"/app/chunk.js"`
-			sub2 := importMapValueRe.FindStringSubmatch(jv)
-			if len(sub2) < 2 {
-				return jv
+	rewriteJSONRootRelativeBlock := func(blockRe *regexp.Regexp, s string) string {
+		return blockRe.ReplaceAllStringFunc(s, func(m string) string {
+			sub := blockRe.FindStringSubmatch(m)
+			if len(sub) < 2 {
+				return m
 			}
-			path := sub2[1]
-			if strings.HasPrefix(path, subdomainPrefix) || strings.HasPrefix(path, "//") {
-				return jv
-			}
-			return `"` + pfx + path + `"`
+			inner := sub[1]
+			rewrittenInner := importMapValueRe.ReplaceAllStringFunc(inner, func(jv string) string {
+				sub2 := importMapValueRe.FindStringSubmatch(jv)
+				if len(sub2) < 2 {
+					return jv
+				}
+				path := sub2[1]
+				if strings.HasPrefix(path, subdomainPrefix) || strings.HasPrefix(path, "//") {
+					return jv
+				}
+				return `"` + pfx + path + `"`
+			})
+			return strings.Replace(m, inner, rewrittenInner, 1)
 		})
-		// Reconstruct the full <script type="importmap"> block with the rewritten body.
-		return strings.Replace(m, inner, rewrittenInner, 1)
-	})
+	}
+	s = rewriteJSONRootRelativeBlock(importMapRe, s)
+	// Speculation rules are inline JSON URL lists (prefetch/prerender).
+	// Root-relative paths in them resolve against the proxy root on subdomain pages.
+	s = rewriteJSONRootRelativeBlock(speculationRulesRe, s)
 
 	return s
 }
