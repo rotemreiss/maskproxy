@@ -205,9 +205,13 @@ const subdomainSPAScript = `<script>(function(){` +
 	`if(typeof url==='string'&&url.startsWith('/')&&!url.startsWith('/__sd__/'))url=pfx+url;` +
 	`return o(url);};});` +
 	// Patch window.fetch for root-relative API calls.
+	// Handles both string URLs and Request objects.
 	`var oF=window.fetch;` +
 	`window.fetch=function(i,o){` +
 	`if(typeof i==='string'&&i.startsWith('/')&&!i.startsWith('/__sd__/'))i=pfx+i;` +
+	`else if(i&&typeof i==='object'&&i.url&&i.url.startsWith(location.origin+'/')` +
+	`&&!i.url.slice(location.origin.length).startsWith('/__sd__/'))` +
+	`i=new Request(location.origin+pfx+i.url.slice(location.origin.length),i);` +
 	`return oF.call(this,i,o);};` +
 	// Patch XMLHttpRequest.open for root-relative XHR calls.
 	`var oX=XMLHttpRequest.prototype.open;` +
