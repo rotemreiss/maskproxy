@@ -2486,3 +2486,67 @@ func TestSRIIntegrityStripped(t *testing.T) {
 		t.Errorf("src attribute unexpectedly removed: %s", s)
 	}
 }
+
+// TestLinkHeaderIntegrityStripped verifies that the integrity parameter is
+// removed from Link response headers so that browser preload SRI checks don't
+// block resources whose bytes have been modified by the proxy.
+func TestLinkHeaderIntegrityStripped(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A typical preload Link header with integrity and crossorigin params.
+		w.Header().Set("Link", `</app.js>; rel=preload; as=script; integrity=sha256-abc123; crossorigin=anonymous, </style.css>; rel=preload; as=style; integrity="sha384-xyz789"`)
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html></html>")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := http.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	link := resp.Header.Get("Link")
+	if strings.Contains(strings.ToLower(link), "integrity") {
+		t.Errorf("integrity param not stripped from Link header: %q", link)
+	}
+	// rel=preload and crossorigin should remain.
+	if !strings.Contains(link, "rel=preload") {
+		t.Errorf("rel=preload unexpectedly removed from Link header: %q", link)
+	}
+	if !strings.Contains(link, "crossorigin=anonymous") {
+		t.Errorf("crossorigin unexpectedly removed from Link header: %q", link)
+	}
+}
+
+// TestServiceWorkerAllowedStripped verifies that Service-Worker-Allowed is
+// removed from responses to prevent a SW from claiming the entire proxy origin.
+func TestServiceWorkerAllowedStripped(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Service-Worker-Allowed", "/")
+		w.Header().Set("Content-Type", "application/javascript")
+		fmt.Fprint(w, "self.addEventListener('fetch', ()=>{})")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := http.Get(ps.URL + "/sw.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if v := resp.Header.Get("Service-Worker-Allowed"); v != "" {
+		t.Errorf("Service-Worker-Allowed not stripped: %q", v)
+	}
+}

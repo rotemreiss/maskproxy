@@ -104,6 +104,13 @@ var linkHeaderRe = regexp.MustCompile(`<(/[^/][^>]*)>`)
 // are sent and stripping it might break requests unnecessarily.
 var sriIntegrityRe = regexp.MustCompile(`(?i)\s+integrity\s*=\s*(?:"[^"]*"|'[^']*')`)
 
+// linkIntegrityRe strips the `; integrity=<hash>` parameter from HTTP Link
+// header values.  A Link header can carry an integrity attribute for
+// preload/preconnect hints (e.g. `Link: </app.js>; rel=preload; integrity=sha256-xxx`).
+// After the proxy rewrites the referenced resource, the hash is stale and the
+// browser would reject the preloaded bytes.  Strip it unconditionally.
+var linkIntegrityRe = regexp.MustCompile(`(?i);\s*integrity\s*=\s*(?:"[^"]*"|'[^']*'|[^\s;,>]*)`)
+
 // maxBodyRewriteDefault is the default maximum body size for rewriting.
 const maxBodyRewriteDefault = int64(50 * 1024 * 1024) // 50 MiB
 
@@ -156,6 +163,12 @@ var headersStrip = map[string]bool{
 	// Cross-Origin-Resource-Policy: same-origin would block the proxy from
 	// forwarding cross-origin subresources (images, fonts, etc.).
 	"Cross-Origin-Resource-Policy": true,
+
+	// Service-Worker-Allowed: if set to "/", a service worker registered
+	// at /__sd__/<host>/sw.js could claim the entire proxy origin (including
+	// other subdomain routes), intercepting and potentially corrupting
+	// requests.  Strip the header so the SW scope is limited to its own path.
+	"Service-Worker-Allowed": true,
 
 	// ETag and Last-Modified enable conditional requests (If-None-Match /
 	// If-Modified-Since).  If the browser cached a previous proxy response and
@@ -1423,37 +1436,42 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			}
 			for i, v := range vals {
 				v = maskResponseString(v, targetHost, rootDomain, effectiveProxyAddr, subdomainRe, bareTargetRe)
-				if headerSubHost != "" {
-					switch key {
-					case "Location", "Content-Location":
-						// Plain URL value — prefix root-relative paths.
-						if strings.HasPrefix(v, "/") && !strings.HasPrefix(v, "//") && !strings.HasPrefix(v, subdomainPrefix) {
-							v = subdomainPrefix + headerSubHost + v
-						}
-					case "Refresh":
-						// Format: "N" or "N; url=<url>" — fix the url= part if present.
-						if idx := strings.Index(strings.ToLower(v), "url="); idx >= 0 {
-							urlPart := v[idx+4:]
-							if strings.HasPrefix(urlPart, "/") && !strings.HasPrefix(urlPart, "//") && !strings.HasPrefix(urlPart, subdomainPrefix) {
-								v = v[:idx+4] + subdomainPrefix + headerSubHost + urlPart
-							}
-						}
-					case "Link":
-						// Format: comma-separated entries like `</path>; rel=preload`.
-						// Prefix root-relative paths inside <…> angle brackets.
-						v = linkHeaderRe.ReplaceAllStringFunc(v, func(m string) string {
-							sub := linkHeaderRe.FindStringSubmatch(m)
-							if len(sub) < 2 {
-								return m
-							}
-							path := sub[1]
-							if strings.HasPrefix(path, "//") || strings.HasPrefix(path, subdomainPrefix) {
-								return m
-							}
-							return "<" + subdomainPrefix + headerSubHost + path + ">"
-						})
+			if headerSubHost != "" {
+				switch key {
+				case "Location", "Content-Location":
+					// Plain URL value — prefix root-relative paths.
+					if strings.HasPrefix(v, "/") && !strings.HasPrefix(v, "//") && !strings.HasPrefix(v, subdomainPrefix) {
+						v = subdomainPrefix + headerSubHost + v
 					}
+				case "Refresh":
+					// Format: "N" or "N; url=<url>" — fix the url= part if present.
+					if idx := strings.Index(strings.ToLower(v), "url="); idx >= 0 {
+						urlPart := v[idx+4:]
+						if strings.HasPrefix(urlPart, "/") && !strings.HasPrefix(urlPart, "//") && !strings.HasPrefix(urlPart, subdomainPrefix) {
+							v = v[:idx+4] + subdomainPrefix + headerSubHost + urlPart
+						}
+					}
+				case "Link":
+					// Format: comma-separated entries like `</path>; rel=preload`.
+					// Prefix root-relative paths inside <…> angle brackets.
+					v = linkHeaderRe.ReplaceAllStringFunc(v, func(m string) string {
+						sub := linkHeaderRe.FindStringSubmatch(m)
+						if len(sub) < 2 {
+							return m
+						}
+						path := sub[1]
+						if strings.HasPrefix(path, "//") || strings.HasPrefix(path, subdomainPrefix) {
+							return m
+						}
+						return "<" + subdomainPrefix + headerSubHost + path + ">"
+					})
 				}
+			}
+			// Strip integrity parameters from Link header values — they reference
+			// the upstream hash which is stale after any body rewriting.
+			if key == "Link" {
+				v = linkIntegrityRe.ReplaceAllString(v, "")
+			}
 				v = withExternalURLsProtected(v, "http://"+effectiveProxyAddr, rep.ToAlias)
 				resp.Header[key][i] = v
 			}
