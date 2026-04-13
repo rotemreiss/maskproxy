@@ -1670,6 +1670,18 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			}
 		}
 
+		// Normalize Access-Control-Allow-Origin after the generic header loop.
+		// maskResponseString rewrites subdomain URLs with the /__sd__/<host>
+		// path prefix, which is correct for Location/Link/body URLs but wrong
+		// for ACAO: "http://localhost:PORT/__sd__/api.upstream.com" is not a
+		// valid origin and browsers won't accept it as matching "http://localhost:PORT".
+		// Strip the /__sd__/<host> suffix so the header holds a bare origin.
+		if acao := resp.Header.Get("Access-Control-Allow-Origin"); acao != "" && acao != "*" && acao != "null" {
+			if idx := strings.Index(acao, subdomainPrefix); idx > 0 {
+				resp.Header.Set("Access-Control-Allow-Origin", acao[:idx])
+			}
+		}
+
 		// ── Phase 2: body rewrite — only for text content types ──────────────
 		// Binary responses (images, fonts, archives) must NOT be rewritten;
 		// byte-level replacement would corrupt them.

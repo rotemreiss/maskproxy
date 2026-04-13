@@ -2993,3 +2993,49 @@ func TestSubdomainSPAScriptNotInjectedForMainTarget(t *testing.T) {
 		t.Errorf("SPA script injected for main target response (should not be):\n%s", body)
 	}
 }
+
+// TestAccessControlAllowOriginSubdomainNormalized verifies that
+// Access-Control-Allow-Origin values rewritten by the subdomain rewriter
+// are normalized to a bare origin (scheme+host+port), not a URL with a
+// /__sd__/<host> path.  Without this fix the browser's CORS check fails
+// because the header value wouldn't match the request's Origin.
+func TestAccessControlAllowOriginSubdomainNormalized(t *testing.T) {
+const apiHost = "api.example.com"
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// Upstream reports that the API allows cross-origin requests from its
+// own subdomain (e.g. the SPA lives on example.com and the API on
+// api.example.com).
+w.Header().Set("Access-Control-Allow-Origin", "https://"+apiHost)
+w.Header().Set("Content-Type", "text/plain")
+fmt.Fprint(w, "data")
+}))
+defer upstream.Close()
+
+rep, _ := NewReplacer("", false)
+proxy := NewReverseProxy("example.com", "http", rep, false, "localhost:9048", false, 0, testLogger(), nil, nil, 0)
+proxy.Transport = &fixedHostTransport{upstream: upstream}
+
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+req, _ := http.NewRequest("GET", ps.URL+"/__sd__/"+apiHost+"/data", nil)
+resp, err := http.DefaultClient.Do(req)
+if err != nil {
+t.Fatalf("request failed: %v", err)
+}
+resp.Body.Close()
+
+	acao := resp.Header.Get("Access-Control-Allow-Origin")
+	// Must be a bare origin — no path or /__sd__/ component.
+	if strings.Contains(acao, "/__sd__/") {
+		t.Errorf("ACAO still contains /__sd__/ path (browser CORS would fail): %q", acao)
+	}
+	if strings.Contains(acao, apiHost) {
+		t.Errorf("ACAO still contains upstream hostname %q: %q", apiHost, acao)
+	}
+	// Should be a bare origin (no path after scheme+host:port).
+	withoutScheme := strings.TrimPrefix(acao, "http://")
+	if strings.Contains(withoutScheme, "/") {
+		t.Errorf("ACAO contains path component (not a bare origin): %q", acao)
+	}
+}
