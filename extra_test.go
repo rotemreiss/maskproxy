@@ -597,6 +597,13 @@ func TestProxyCSPHSTSStripped(t *testing.T) {
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		w.Header().Set("Public-Key-Pins", `pin-sha256="abc"; max-age=60`)
 		w.Header().Set("Expect-CT", "max-age=86400, enforce")
+		// NEL and Report-To send network telemetry to upstream — must be stripped.
+		w.Header().Set("Report-To", `{"group":"default","max_age":86400,"endpoints":[{"url":"https://upstream.example/report"}]}`)
+		w.Header().Set("Nel", `{"report_to":"default","max_age":86400}`)
+		// COOP/COEP enforce cross-origin isolation and break the proxy model.
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		w.Header().Set("Cross-Origin-Embedder-Policy", "require-corp")
+		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprint(w, "ok")
 	}))
@@ -627,8 +634,13 @@ func TestProxyCSPHSTSStripped(t *testing.T) {
 		t.Error("Content-Security-Policy-Report-Only should be present")
 	}
 
-	// Security headers that reveal upstream identity must be stripped entirely.
-	for _, h := range []string{"Strict-Transport-Security", "Public-Key-Pins", "Expect-CT"} {
+	// Security/isolation headers that must be stripped entirely.
+	for _, h := range []string{
+		"Strict-Transport-Security", "Public-Key-Pins", "Expect-CT",
+		"Report-To", "Nel",
+		"Cross-Origin-Opener-Policy", "Cross-Origin-Embedder-Policy",
+		"Cross-Origin-Resource-Policy",
+	} {
 		if v := resp.Header.Get(h); v != "" {
 			t.Errorf("header %q should be stripped, got %q", h, v)
 		}

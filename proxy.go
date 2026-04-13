@@ -125,6 +125,25 @@ var headersStrip = map[string]bool{
 	"Public-Key-Pins":             true,
 	"Public-Key-Pins-Report-Only": true,
 	"Expect-CT":                   true,
+
+	// Report-To and NEL instruct the browser to send error/network reports to
+	// upstream collection endpoints, leaking real hostnames and traffic details.
+	"Report-To":                     true,
+	"Nel":                           true,
+
+	// Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy enforce strict
+	// cross-origin isolation. When the proxy serves pages from multiple upstream
+	// origins (via /__sd__/), COOP same-origin would prevent cross-window comms
+	// and COEP require-corp would block subresources that don't opt in — both
+	// break normal proxy operation.
+	"Cross-Origin-Opener-Policy":          true,
+	"Cross-Origin-Opener-Policy-Report-Only": true,
+	"Cross-Origin-Embedder-Policy":        true,
+	"Cross-Origin-Embedder-Policy-Report-Only": true,
+
+	// Cross-Origin-Resource-Policy: same-origin would block the proxy from
+	// forwarding cross-origin subresources (images, fonts, etc.).
+	"Cross-Origin-Resource-Policy": true,
 }
 
 // textContentTypes lists MIME type prefixes for which body replacement is safe.
