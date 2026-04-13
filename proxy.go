@@ -562,10 +562,17 @@ func rewriteCSPToken(token, targetLower, rootLower, proxyAddr string) string {
 	// Strip optional wildcard subdomain prefix "*.".
 	rest = strings.TrimPrefix(rest, "*.")
 
+	// Strip optional path suffix to isolate the host[:port] portion.
+	// CSP connect-src entries can include paths, e.g. "https://api.github.com/v2/*".
+	hostPort := rest
+	if i := strings.Index(rest, "/"); i >= 0 {
+		hostPort = rest[:i]
+	}
+
 	// Strip optional port suffix to isolate the bare hostname.
-	host := rest
-	if i := strings.LastIndex(rest, ":"); i >= 0 {
-		host = rest[:i]
+	host := hostPort
+	if i := strings.LastIndex(hostPort, ":"); i >= 0 {
+		host = hostPort[:i]
 	}
 
 	// Check whether the host belongs to the target domain (exact match or subdomain).

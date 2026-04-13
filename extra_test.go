@@ -1151,6 +1151,16 @@ name: "proxyAddr empty disables rewriting",
 in:   "default-src https://microsoft.com",
 want: "default-src https://microsoft.com",
 },
+{
+name: "token with path rewritten (connect-src)",
+in:   "connect-src https://api.microsoft.com/v2/*",
+want: "connect-src http://localhost:9001",
+},
+{
+name: "token with port and path rewritten",
+in:   "connect-src https://api.microsoft.com:8443/v2/*",
+want: "connect-src http://localhost:9001",
+},
 }
 
 for _, tc := range cases {
