@@ -1919,6 +1919,41 @@ func TestChunkedResponseBodyRewrite(t *testing.T) {
 	}
 }
 
+// TestSubdomainLinkHeaderRewrite verifies that root-relative URLs in Link headers
+// (e.g., </api/data>; rel=preload) from subdomain responses get prefixed with
+// /__sd__/<host> so preload/prefetch hints don't escape the proxy context.
+func TestSubdomainLinkHeaderRewrite(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", `</api/data>; rel=preload, </fonts/x.woff2>; rel=preload; as=font`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	rootHost := "example.com"
+	subHost := "api.example.com"
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(rootHost, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/__sd__/" + subHost + "/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	link := resp.Header.Get("Link")
+	if !strings.Contains(link, "</__sd__/"+subHost+"/api/data>") {
+		t.Errorf("Link header missing rewritten /api/data: %q", link)
+	}
+	if !strings.Contains(link, "</__sd__/"+subHost+"/fonts/x.woff2>") {
+		t.Errorf("Link header missing rewritten /fonts/x.woff2: %q", link)
+	}
+}
+
 // TestSubdomainRefreshHeaderRewrite verifies that a root-relative Refresh header
 // (format: "N; url=/path") from a subdomain response gets its url= part prefixed
 // with /__sd__/<host> so timed redirects stay within the proxy's routing.

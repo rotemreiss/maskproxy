@@ -85,6 +85,11 @@ var rootRelativeCSSRe = regexp.MustCompile(`(?i)(url\s*\(\s*["']?)(/[^"')<>\s]*)
 // Group 2 = the root-relative path (starts with /).
 var metaRefreshRe = regexp.MustCompile(`(?i)(content\s*=\s*["'][0-9]+\s*;\s*url=)(/[^"'<>\s]*)`)
 
+// linkHeaderRe matches root-relative URLs inside Link header angle brackets.
+// Format: `</path/to/resource>; rel=preload`
+// Group 1 = the root-relative path (the part between < and >).
+var linkHeaderRe = regexp.MustCompile(`<(/[^/][^>]*)>`)
+
 // maxBodyRewrite is the maximum response body size (in bytes) that will be
 // buffered and rewritten. Responses larger than this are forwarded unchanged to
 // prevent out-of-memory conditions when proxying large file downloads.
@@ -1290,8 +1295,9 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// For subdomain-routed responses, also prefix any root-relative redirect
 		// value with /__sd__/<host> so redirects stay within the proxy's routing.
 		// Handles:
-		//   Location: /login       → Location: /__sd__/sub.host.com/login
-		//   Refresh: 0; url=/login → Refresh: 0; url=/__sd__/sub.host.com/login
+		//   Location: /login                     → Location: /__sd__/sub.host.com/login
+		//   Refresh: 0; url=/login               → Refresh: 0; url=/__sd__/sub.host.com/login
+		//   Link: </api/data>; rel=preload        → Link: </__sd__/sub.host.com/api/data>; …
 		headerSubHost := ""
 		if rh := resp.Request.URL.Host; !strings.EqualFold(rh, targetHost) && rh != "" {
 			headerSubHost = rh
@@ -1317,6 +1323,20 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 								v = v[:idx+4] + subdomainPrefix + headerSubHost + urlPart
 							}
 						}
+					case "Link":
+						// Format: comma-separated entries like `</path>; rel=preload`.
+						// Prefix root-relative paths inside <…> angle brackets.
+						v = linkHeaderRe.ReplaceAllStringFunc(v, func(m string) string {
+							sub := linkHeaderRe.FindStringSubmatch(m)
+							if len(sub) < 2 {
+								return m
+							}
+							path := sub[1]
+							if strings.HasPrefix(path, "//") || strings.HasPrefix(path, subdomainPrefix) {
+								return m
+							}
+							return "<" + subdomainPrefix + headerSubHost + path + ">"
+						})
 					}
 				}
 				v = withExternalURLsProtected(v, "http://"+effectiveProxyAddr, rep.ToAlias)
