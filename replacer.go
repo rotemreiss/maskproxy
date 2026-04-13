@@ -179,3 +179,104 @@ func (r *Replacer) ToAlias(s string) string {
 func (r *Replacer) HasPairs() bool {
 	return len(r.forResponse) > 0
 }
+
+// ToOriginalDiff is like ToOriginal but also returns the number of substitutions made.
+func (r *Replacer) ToOriginalDiff(s string) (string, int) {
+	count := 0
+	if r.reReq != nil {
+		lookup := make(map[string]string, len(r.forRequest))
+		for _, p := range r.forRequest {
+			key := p.Alias
+			if r.caseInsensitive {
+				key = strings.ToLower(key)
+			}
+			lookup[key] = p.Original
+		}
+		result := r.reReq.ReplaceAllStringFunc(s, func(m string) string {
+			key := m
+			if r.caseInsensitive {
+				key = strings.ToLower(key)
+			}
+			if v, ok := lookup[key]; ok {
+				count++
+				return v
+			}
+			return m
+		})
+		return result, count
+	}
+	result := s
+	for _, p := range r.forRequest {
+		var rewritten string
+		if r.caseInsensitive {
+			rewritten = replaceCI(result, p.Alias, p.Original)
+		} else {
+			rewritten = strings.ReplaceAll(result, p.Alias, p.Original)
+		}
+		// Count occurrences by measuring length difference against alias/original lengths.
+		if len(p.Alias) > 0 {
+			count += (len(result) - len(rewritten) + len(p.Original)*countOccurrences(result, p.Alias, r.caseInsensitive)) / max(len(p.Alias), 1)
+		}
+		result = rewritten
+	}
+	return result, count
+}
+
+// ToAliasDiff is like ToAlias but also returns the number of substitutions made.
+func (r *Replacer) ToAliasDiff(s string) (string, int) {
+	count := 0
+	if r.reResp != nil {
+		lookup := make(map[string]string, len(r.forResponse))
+		for _, p := range r.forResponse {
+			key := p.Original
+			if r.caseInsensitive {
+				key = strings.ToLower(key)
+			}
+			lookup[key] = p.Alias
+		}
+		result := r.reResp.ReplaceAllStringFunc(s, func(m string) string {
+			key := m
+			if r.caseInsensitive {
+				key = strings.ToLower(key)
+			}
+			if v, ok := lookup[key]; ok {
+				count++
+				return v
+			}
+			return m
+		})
+		return result, count
+	}
+	result := s
+	for _, p := range r.forResponse {
+		var rewritten string
+		if r.caseInsensitive {
+			rewritten = replaceCI(result, p.Original, p.Alias)
+		} else {
+			rewritten = strings.ReplaceAll(result, p.Original, p.Alias)
+		}
+		result = rewritten
+	}
+	return result, count
+}
+
+// countOccurrences returns the number of times sub appears in s.
+// When ci is true the comparison is case-insensitive.
+func countOccurrences(s, sub string, ci bool) int {
+	if sub == "" {
+		return 0
+	}
+	if ci {
+		s = strings.ToLower(s)
+		sub = strings.ToLower(sub)
+	}
+	return strings.Count(s, sub)
+}
+
+// max returns the larger of a and b (for Go <1.21 compatibility).
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

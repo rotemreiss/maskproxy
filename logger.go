@@ -28,7 +28,7 @@ var sensitiveHeaders = map[string]bool{
 // Logger is a thin wrapper around the standard library logger that supports
 // two log levels (normal and verbose) and optional tee output to a file.
 //
-// Normal:  one line per request/response — method + URL + status + size.
+// Normal:  one line per request/response — method + URL + status + size + replacement count.
 // Verbose: the above plus all headers and a body preview (4 KiB).
 type Logger struct {
 l       *log.Logger
@@ -81,13 +81,27 @@ lg.l.Printf(format, args...)
 // LogRequest writes one log line per outbound request (always shown), plus a
 // full header + body dump when verbose is enabled.
 //
-// bodySnapshot is the rewritten request body string; pass "" for bodyless
-// requests (GET, HEAD, etc.). Only used in verbose mode.
+// bodySnapshot is the rewritten request body string; pass "" for bodyless requests.
+// isWS must be true for WebSocket upgrades — the log line shows "WS↑" instead of
+// the HTTP method and no matching response line will appear (WS connections live
+// for the duration of the session and bypass ModifyResponse).
+// replaceCount is the total number of string substitutions made in the request.
 //
 // Returns the current time so LogResponse can compute round-trip latency.
-func (lg *Logger) LogRequest(req *http.Request, bodySnapshot string) time.Time {
+func (lg *Logger) LogRequest(req *http.Request, bodySnapshot string, isWS bool, replaceCount int) time.Time {
 start := time.Now()
-lg.l.Printf("-> %-6s %s", req.Method, req.URL)
+
+method := req.Method
+if isWS {
+method = "WS↑  "
+}
+
+// Show replacement count in normal mode so operators can confirm replacements are firing.
+suffix := ""
+if replaceCount > 0 {
+suffix = fmt.Sprintf("  [%d replaced]", replaceCount)
+}
+lg.l.Printf("-> %-6s %s%s", method, req.URL, suffix)
 
 if !lg.verbose {
 return start
@@ -116,19 +130,23 @@ return start
 // LogResponse writes one log line per inbound response (always shown), plus a
 // full header + body dump when verbose is enabled.
 //
-// bodySnapshot is the rewritten response body; pass "" for binary assets or
-// empty bodies. Only used in verbose mode.
-//
+// bodySnapshot is the rewritten response body; pass "" for binary assets or empty bodies.
+// replaceCount is the total number of string substitutions made in the response body.
 // start is the time returned by LogRequest; used to compute round-trip latency.
-func (lg *Logger) LogResponse(resp *http.Response, bodySnapshot string, start time.Time) {
+func (lg *Logger) LogResponse(resp *http.Response, bodySnapshot string, start time.Time, replaceCount int) {
 elapsed := time.Since(start)
 // Use ContentLength from headers when available; fall back to snapshot size.
 size := resp.ContentLength
 if size < 0 {
 size = int64(len(bodySnapshot))
 }
-lg.l.Printf("<- %-3d  %s  (%s, %s)",
-resp.StatusCode, resp.Request.URL, humanBytes(size), elapsed.Round(time.Millisecond))
+
+suffix := ""
+if replaceCount > 0 {
+suffix = fmt.Sprintf("  [%d replaced]", replaceCount)
+}
+lg.l.Printf("<- %-3d  %s  (%s, %s)%s",
+resp.StatusCode, resp.Request.URL, humanBytes(size), elapsed.Round(time.Millisecond), suffix)
 
 if !lg.verbose {
 return

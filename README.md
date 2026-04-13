@@ -28,16 +28,19 @@ go build -o maskproxy .
 maskproxy -target <host> [options]
 
 Options:
-  -target      <host>   Upstream host (required, no scheme — HTTPS by default)
-  -replace     <pairs>  Comma-separated original:alias pairs (e.g. ctf:acme,ctfd:foo)
-  -insecure             Connect to upstream over plain HTTP instead of HTTPS
-  -skip-verify          Skip TLS certificate verification (self-signed certs)
-  -verbose              Log every request/response with full headers and body preview
-  -log         <path>   Append log output to file in addition to stderr
-  -ci                   Case-insensitive string replacement
-  -exact-domain         Only mask the exact target host, not subdomains
-  -port        <n>      Local port (default: 8080)
-  -listen      <addr>   Local bind address (default: 0.0.0.0)
+  -target       <host>     Upstream host (required, no scheme — HTTPS by default)
+  -replace      <pairs>    Comma-separated original:alias pairs (e.g. ctf:acme,ctfd:foo)
+  -replace-file <path>     File with one original:alias pair per line (# comments ok)
+  -insecure                Connect to upstream over plain HTTP instead of HTTPS
+  -skip-verify             Skip TLS certificate verification (self-signed certs)
+  -ci                      Case-insensitive string replacement
+  -exact-domain            Only mask the exact target host, not subdomains
+  -timeout      <duration> Upstream dial/TLS/response-header timeout (default: 30s)
+  -drain        <duration> Grace period for in-flight requests on Ctrl+C (default: 15s)
+  -verbose                 Log every request/response with full headers and body preview
+  -log          <path>     Append log output to file in addition to stderr
+  -port         <n>        Local port (default: 8080)
+  -listen       <addr>     Local bind address (default: 0.0.0.0)
 ```
 
 ## Example
@@ -45,6 +48,9 @@ Options:
 ```bash
 # HTTPS upstream (default)
 maskproxy -target ctf.io -replace ctf:acme,ctfd:foo
+
+# Load pairs from a file (one per line, # comments ok)
+maskproxy -target ctf.io -replace-file pairs.txt
 
 # Self-signed certificate
 maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -skip-verify
@@ -77,3 +83,8 @@ maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -verbose -log proxy.log
 - `Content-Length` is recalculated after every body rewrite.
 - `Accept-Encoding` on outbound requests is limited to `gzip, identity` so only encodings the proxy can handle reach the upstream.
 - `X-Forwarded-For` from the client is stripped to prevent header injection.
+- **WebSocket** connections are transparently proxied (upgraded through `httputil.ReverseProxy` with `FlushInterval=-1`). WS frames are binary-framed and therefore not string-replaced — the upgrade is logged as `WS↑`.
+- **Graceful shutdown**: Ctrl+C / SIGTERM drain in-flight requests for up to `-drain` seconds before exiting.
+- **Replacement count** is logged on every request/response line so you can confirm replacements are firing without enabling `-verbose`.
+- **Upstream timeouts** (`-timeout`) guard against hung upstreams: covers TCP dial, TLS handshake, and response-header wait phases independently.
+- **`-replace-file`** lets you maintain replacement pairs in a text file with comments, avoiding shell quoting headaches for large pair sets.

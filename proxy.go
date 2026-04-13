@@ -370,9 +370,12 @@ func unmaskRequestString(s, targetHost, scheme, proxyAddr string) string {
 // proxy address so no subdomain leaks to the client.  Set exactDomain=true to
 // restrict masking to the exact target host only.
 //
+// upstreamTimeout controls how long the proxy waits for upstream dial, TLS
+// handshake, and response headers.  Zero means no timeout (use with caution).
+//
 // logger handles all per-request and startup logging; pass a Logger constructed
 // with NewLogger.
-func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, logger *Logger) *httputil.ReverseProxy {
+func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger) *httputil.ReverseProxy {
 	target := &url.URL{Scheme: scheme, Host: targetHost}
 
 	// Build a single regex that matches the scheme+host prefix of any subdomain
@@ -407,8 +410,20 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	}
 
 	// Clone DefaultTransport to preserve connection-pooling and timeout settings,
-	// then override TLS config when certificate verification must be skipped.
+	// then override TLS config when certificate verification must be skipped and
+	// apply explicit per-phase timeouts to prevent hung upstreams from leaking
+	// goroutines indefinitely.
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if upstreamTimeout > 0 {
+		// DialContext: how long to wait for TCP connection to upstream.
+		transport.DialContext = (&net.Dialer{Timeout: upstreamTimeout}).DialContext
+		// TLSHandshakeTimeout: how long to wait for the TLS handshake.
+		transport.TLSHandshakeTimeout = upstreamTimeout
+		// ResponseHeaderTimeout: how long to wait for the upstream to start
+		// sending response headers after the request body has been sent.
+		// This is separate from reading the body — streaming responses are fine.
+		transport.ResponseHeaderTimeout = upstreamTimeout
+	}
 	if insecure {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // intentional for CTF
 		logger.Printf("maskproxy: WARNING — TLS certificate verification disabled (-skip-verify)")
@@ -503,20 +518,23 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			req.Body.Close()
 			if err == nil {
 				rewritten := string(body)
+				replaceCount := 0
 				if rep.HasPairs() {
-					rewritten = rep.ToOriginal(rewritten)
+					rewritten, replaceCount = rep.ToOriginalDiff(rewritten)
 				}
 				rewritten = unmaskRequestString(rewritten, outboundHost, scheme, proxyAddr)
 				req.Body = io.NopCloser(strings.NewReader(rewritten))
 				req.ContentLength = int64(len(rewritten))
-				// Log request now that body is fully rewritten.  The body snapshot
-				// is only materialised in verbose mode (LogRequest checks internally).
-				start := logger.LogRequest(req, rewritten)
+				start := logger.LogRequest(req, rewritten, false, replaceCount)
 				reqTimes.Store(req, start)
 			}
 		} else {
 			// Bodyless request (GET, HEAD, etc.) — still log + record start time.
-			start := logger.LogRequest(req, "")
+			// Detect WebSocket upgrade so the log line is clearly distinct from
+			// ordinary HTTP requests (WS connections live for minutes; they never
+			// produce a matching response log line from ModifyResponse).
+			isWS := strings.EqualFold(req.Header.Get("Upgrade"), "websocket")
+			start := logger.LogRequest(req, "", isWS, 0)
 			reqTimes.Store(req, start)
 		}
 
@@ -587,7 +605,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		contentType := resp.Header.Get("Content-Type")
 		if !isTextContent(contentType) {
 			// Log before returning — no body snapshot for binary content.
-			logger.LogResponse(resp, "", start)
+			logger.LogResponse(resp, "", start, 0)
 			return nil
 		}
 
@@ -599,7 +617,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			resp.StatusCode == http.StatusNoContent ||
 			resp.StatusCode == http.StatusNotModified
 		if noBody {
-			logger.LogResponse(resp, "", start)
+			logger.LogResponse(resp, "", start, 0)
 			return nil
 		}
 
@@ -610,7 +628,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			gz, err := gzip.NewReader(resp.Body)
 			if err != nil {
 				logger.Printf("maskproxy: failed to decode gzip response: %v", err)
-				logger.LogResponse(resp, "", start)
+				logger.LogResponse(resp, "", start, 0)
 				return nil
 			}
 			defer gz.Close()
@@ -630,7 +648,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// be reconstructed; we forward the decompressed portion and log a warning.
 		if int64(len(raw)) > maxBodyRewrite {
 			logger.Printf("maskproxy: response body exceeds %d bytes; skipping rewrite", maxBodyRewrite)
-			logger.LogResponse(resp, "", start)
+			logger.LogResponse(resp, "", start, 0)
 			if isGzip {
 				resp.Body = io.NopCloser(strings.NewReader(string(raw)))
 			} else {
@@ -650,8 +668,17 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		//
 		//   Pass 2 — User replacements (original → alias):
 		//     "ctf" → "acme",  "ctfd" → "foo"
+		//
+		// We also count how many user-substitutions happened so the log line can
+		// report "[N replaced]" even in non-verbose mode.
 		rewritten := maskResponseString(string(raw), targetHost, rootDomain, proxyAddr, subdomainRe)
-		rewritten = withExternalURLsProtected(rewritten, "http://"+proxyAddr, rep.ToAlias)
+		var replaceCount int
+		rewritten = withExternalURLsProtected(rewritten, "http://"+proxyAddr, func(s string) string {
+			var n int
+			s, n = rep.ToAliasDiff(s)
+			replaceCount += n
+			return s
+		})
 
 		resp.Body = io.NopCloser(strings.NewReader(rewritten))
 		// Recalculate Content-Length — byte length may change when replacement
@@ -659,7 +686,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		resp.ContentLength = int64(len(rewritten))
 		resp.Header.Set("Content-Length", strconv.FormatInt(int64(len(rewritten)), 10))
 
-		logger.LogResponse(resp, rewritten, start)
+		logger.LogResponse(resp, rewritten, start, replaceCount)
 		return nil
 	}
 
@@ -675,5 +702,14 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		ModifyResponse: modifyResponse,
 		ErrorHandler:   errorHandler,
 		Transport:      transport,
+		// FlushInterval=-1 enables immediate flushing (streaming mode).
+		// This is required for WebSocket and Server-Sent Events: when a client
+		// sends "Upgrade: websocket", httputil.ReverseProxy detects the 101
+		// Switching Protocols response and enters bidirectional copy mode,
+		// bypassing ModifyResponse entirely (correct — WS frames are binary and
+		// cannot be string-replaced without corrupting the framing protocol).
+		// Without this setting the proxy would attempt to buffer the connection
+		// indefinitely and the upgrade would never complete.
+		FlushInterval: -1,
 	}
 }

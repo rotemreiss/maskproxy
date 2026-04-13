@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 )
 
 const usage = `maskproxy — a transparent rewriting reverse proxy
@@ -14,36 +19,46 @@ Usage:
   maskproxy -target <host> [options]
 
 Options:
-  -target      <host>    Upstream host to proxy traffic to (required).
-                         Do NOT include a scheme — HTTPS is used by default.
-                         Use -insecure to connect over plain HTTP instead.
-  -replace     <pairs>   Comma-separated list of original:alias pairs.
-                         Aliases are used by the client; originals are sent
-                         to the upstream server.
-                         Example: ctf:acme,ctfd:foo
-  -insecure              Connect to the upstream over plain HTTP (no TLS).
-                         Default is HTTPS.
-  -skip-verify           Skip TLS certificate verification for the upstream.
-                         Use this when the target has a self-signed certificate.
-  -ci                    Case-insensitive string replacement.
-                         Matches "Microsoft", "MICROSOFT", "microsoft", etc.
-  -exact-domain          Only mask the exact target host.
-                         By default maskproxy also masks every subdomain of the
-                         target's root domain (api.*, cdn.*, auth.*, …) so
-                         no subdomain leaks to the client.  Use -exact-domain
-                         to restrict masking to the literal -target host only.
-  -verbose               Log every request and response with full headers and
-                         a body preview (first 4 KiB).  Sensitive headers
-                         (Authorization, Cookie, Set-Cookie) are redacted.
-  -log         <path>    Append all log output to <path> in addition to stderr.
-                         Works with both normal and -verbose mode.
-  -port        <n>       Local port to listen on (default: 8080).
-  -listen      <addr>    Local listen address (default: 0.0.0.0).
-                         Use "127.0.0.1" to restrict to loopback only.
+  -target       <host>     Upstream host to proxy traffic to (required).
+                           Do NOT include a scheme — HTTPS is used by default.
+                           Use -insecure to connect over plain HTTP instead.
+  -replace      <pairs>    Comma-separated list of original:alias pairs.
+                           Aliases are used by the client; originals are sent
+                           to the upstream server.
+                           Example: ctf:acme,ctfd:foo
+  -replace-file <path>     Path to a file with one original:alias pair per line.
+                           Lines starting with '#' and blank lines are ignored.
+                           Combined with any -replace pairs (CLI pairs win on conflict).
+  -insecure                Connect to the upstream over plain HTTP (no TLS).
+                           Default is HTTPS.
+  -skip-verify             Skip TLS certificate verification for the upstream.
+                           Use this when the target has a self-signed certificate.
+  -ci                      Case-insensitive string replacement.
+                           Matches "Microsoft", "MICROSOFT", "microsoft", etc.
+  -exact-domain            Only mask the exact target host.
+                           By default maskproxy also masks every subdomain of the
+                           target's root domain (api.*, cdn.*, auth.*, …) so
+                           no subdomain leaks to the client.  Use -exact-domain
+                           to restrict masking to the literal -target host only.
+  -timeout      <duration> Timeout for upstream dial, TLS handshake and response
+                           headers (default: 30s). Set 0 to disable.
+  -drain        <duration> Grace period for in-flight requests on Ctrl+C/SIGTERM
+                           (default: 15s).
+  -verbose                 Log every request and response with full headers and
+                           a body preview (first 4 KiB).  Sensitive headers
+                           (Authorization, Cookie, Set-Cookie) are redacted.
+  -log          <path>     Append all log output to <path> in addition to stderr.
+                           Works with both normal and -verbose mode.
+  -port         <n>        Local port to listen on (default: 8080).
+  -listen       <addr>     Local listen address (default: 0.0.0.0).
+                           Use "127.0.0.1" to restrict to loopback only.
 
 Examples:
   # Proxy localhost:8080 → https://ctf.io, rewriting ctf↔acme and ctfd↔foo
   maskproxy -target ctf.io -replace ctf:acme,ctfd:foo
+
+  # Load replacement pairs from a file
+  maskproxy -target ctf.io -replace-file pairs.txt
 
   # Same but skip TLS certificate verification (self-signed cert)
   maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -skip-verify
@@ -68,14 +83,17 @@ Replacement behaviour:
 func main() {
 	target := flag.String("target", "", "Upstream host (required, no scheme)")
 	replace := flag.String("replace", "", "Comma-separated original:alias pairs, e.g. ctf:acme,ctfd:foo")
+	replaceFile := flag.String("replace-file", "", "File with one original:alias pair per line (# comments ok)")
 	insecure := flag.Bool("insecure", false, "Use plain HTTP for the upstream (no TLS)")
 	skipVerify := flag.Bool("skip-verify", false, "Skip TLS certificate verification (for self-signed certs)")
 	ci := flag.Bool("ci", false, "Case-insensitive string replacement (e.g. matches 'Microsoft' and 'MICROSOFT')")
 	exactDomain := flag.Bool("exact-domain", false, "Only mask the exact target host, not subdomains")
+	timeout := flag.Duration("timeout", 30*time.Second, "Upstream dial/TLS/response-header timeout (0 = no timeout)")
 	verbose := flag.Bool("verbose", false, "Log full request/response headers and body preview")
 	logFile := flag.String("log", "", "Append log output to this file in addition to stderr")
 	port := flag.Int("port", 8080, "Local port to listen on")
 	listen := flag.String("listen", "0.0.0.0", "Local listen address")
+	drain := flag.Duration("drain", 15*time.Second, "Grace period for in-flight requests on SIGINT/SIGTERM")
 
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -99,9 +117,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	rep, err := NewReplacer(*replace, *ci)
+	// Build the combined replacement spec: -replace-file pairs first (lower
+	// priority), then -replace pairs (higher priority / override on conflict).
+	combinedSpec := *replace
+	if *replaceFile != "" {
+		fileSpec, err := loadReplaceFile(*replaceFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: -replace-file: %v\n", err)
+			os.Exit(1)
+		}
+		if fileSpec != "" && combinedSpec != "" {
+			combinedSpec = fileSpec + "," + combinedSpec
+		} else if fileSpec != "" {
+			combinedSpec = fileSpec
+		}
+	}
+
+	rep, err := NewReplacer(combinedSpec, *ci)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: invalid -replace value: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error: invalid replacement pairs: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -117,13 +151,14 @@ func main() {
 		scheme = "http"
 	}
 
-	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, proxyAddr(scheme, *listen, *port), *exactDomain, logger)
+	pAddr := proxyAddr(*listen, *port)
+	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger)
 
 	addr := fmt.Sprintf("%s:%d", *listen, *port)
 	logger.Printf("maskproxy listening on http://%s", addr)
 	logger.Printf("  → upstream: %s://%s", scheme, *target)
 	if rep.HasPairs() {
-		logger.Printf("  → replacements: %s", *replace)
+		logger.Printf("  → replacements: %s", combinedSpec)
 	}
 	if *exactDomain {
 		logger.Printf("  → subdomain masking: disabled (-exact-domain)")
@@ -135,6 +170,9 @@ func main() {
 			logger.Printf("  → subdomain masking: *.%s → proxy", *target)
 		}
 	}
+	if *timeout > 0 {
+		logger.Printf("  → upstream timeout: %s", *timeout)
+	}
 	if *verbose {
 		logger.Printf("  → verbose logging enabled")
 	}
@@ -142,18 +180,101 @@ func main() {
 		logger.Printf("  → log file: %s", *logFile)
 	}
 
-	if err := http.ListenAndServe(addr, proxy); err != nil {
-		logger.Fatal("maskproxy: %v", err)
+	// Use http.Server instead of http.ListenAndServe so we can call Shutdown.
+	// On SIGINT (Ctrl+C) or SIGTERM the server stops accepting new connections
+	// and waits up to -drain seconds for in-flight requests to complete before
+	// the process exits.
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: proxy,
+		// ReadHeaderTimeout guards against Slowloris-style attacks on the proxy
+		// itself (clients that never finish sending headers).
+		ReadHeaderTimeout: 30 * time.Second,
+	}
+
+	// Run the server in a goroutine so the main goroutine can block on signals.
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	// Block until SIGINT/SIGTERM or the server exits on its own.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			logger.Fatal("maskproxy: %v", err)
+		}
+	case sig := <-quit:
+		logger.Printf("maskproxy: received %v — shutting down (drain: %s)", sig, *drain)
+		ctx, cancel := context.WithTimeout(context.Background(), *drain)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			logger.Printf("maskproxy: shutdown error: %v", err)
+		} else {
+			logger.Printf("maskproxy: shutdown complete")
+		}
 	}
 }
 
 // proxyAddr returns the host:port string that clients use to reach the proxy.
 // When bound to 0.0.0.0 (all interfaces), "localhost" is used as the
 // client-visible hostname because that is what browsers send in Referer/Origin.
-func proxyAddr(scheme, listenAddr string, port int) string {
+func proxyAddr(listenAddr string, port int) string {
 	host := listenAddr
 	if host == "0.0.0.0" || host == "::" || host == "" {
 		host = "localhost"
 	}
 	return fmt.Sprintf("%s:%d", host, port)
+}
+
+// loadReplaceFile reads a replacement-pairs file and returns a comma-separated
+// spec string suitable for NewReplacer.
+//
+// File format (one pair per line):
+//
+//	# This is a comment — ignored
+//	ctf:acme
+//	ctfd:foo
+//
+// Blank lines and lines starting with '#' are ignored.
+// Inline '#' comments (after a pair) are also stripped.
+func loadReplaceFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("cannot open %q: %w", path, err)
+	}
+	defer f.Close()
+
+	var pairs []string
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Text()
+
+		// Strip inline comment.
+		if i := strings.Index(line, "#"); i >= 0 {
+			line = line[:i]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Validate format early so the error message references the file+line.
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			return "", fmt.Errorf("%s:%d: invalid pair %q (expected non-empty original:alias)", path, lineNum, line)
+		}
+		pairs = append(pairs, strings.TrimSpace(parts[0])+":"+strings.TrimSpace(parts[1]))
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("reading %q: %w", path, err)
+	}
+	return strings.Join(pairs, ","), nil
 }
