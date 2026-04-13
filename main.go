@@ -29,6 +29,9 @@ Options:
   -replace-file <path>     Path to a file with one original:alias pair per line.
                            Lines starting with '#' and blank lines are ignored.
                            Combined with any -replace pairs (CLI pairs win on conflict).
+  -header       <h>        Add a header to every upstream request (repeatable).
+                           Format: "Name: Value". Overrides same-named client headers.
+                           Example: -header "X-Author: Rotem" -header "X-Token: abc"
   -insecure                Connect to the upstream over plain HTTP (no TLS).
                            Default is HTTPS.
   -skip-verify             Skip TLS certificate verification for the upstream.
@@ -80,6 +83,21 @@ Replacement behaviour:
   (e.g. "ctfd" is always matched before "ctf").
 `
 
+// headerFlag is a repeatable -header flag value.  Each call to Set appends one
+// "Name: Value" entry.  flag.Var registers it so the user can write:
+//
+//	-header "X-Author: Rotem" -header "X-Token: secret"
+type headerFlag []string
+
+func (h *headerFlag) String() string { return strings.Join(*h, ", ") }
+func (h *headerFlag) Set(s string) error {
+	if strings.TrimSpace(s) == "" {
+		return fmt.Errorf("header value must not be empty")
+	}
+	*h = append(*h, s)
+	return nil
+}
+
 func main() {
 	target := flag.String("target", "", "Upstream host (required, no scheme)")
 	replace := flag.String("replace", "", "Comma-separated original:alias pairs, e.g. ctf:acme,ctfd:foo")
@@ -94,6 +112,8 @@ func main() {
 	port := flag.Int("port", 8080, "Local port to listen on")
 	listen := flag.String("listen", "0.0.0.0", "Local listen address")
 	drain := flag.Duration("drain", 15*time.Second, "Grace period for in-flight requests on SIGINT/SIGTERM")
+	var headers headerFlag
+	flag.Var(&headers, "header", `Add a header to every upstream request (repeatable). Format: "Name: Value". Example: -header "X-Author: Rotem"`)
 
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -139,6 +159,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Parse and validate -header flags into headerPair structs.
+	// Parsing happens once here (not per-request) for efficiency.
+	extraHeaders, err := parseHeaders(headers)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: -header: %v\n", err)
+		os.Exit(1)
+	}
+
 	logger, closeLog, err := NewLogger(*verbose, *logFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -152,13 +180,25 @@ func main() {
 	}
 
 	pAddr := proxyAddr(*listen, *port)
-	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger)
+	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger, extraHeaders)
 
 	addr := fmt.Sprintf("%s:%d", *listen, *port)
 	logger.Printf("maskproxy listening on http://%s", addr)
 	logger.Printf("  → upstream: %s://%s", scheme, *target)
 	if rep.HasPairs() {
 		logger.Printf("  → replacements: %s", combinedSpec)
+	}
+	if len(extraHeaders) > 0 {
+		for _, h := range extraHeaders {
+			// Redact values for well-known sensitive header names so that tokens
+			// don't appear in log files when -log is active.
+			val := h.value
+			nameLower := strings.ToLower(h.name)
+			if nameLower == "authorization" || nameLower == "cookie" || strings.Contains(nameLower, "token") || strings.Contains(nameLower, "secret") || strings.Contains(nameLower, "key") {
+				val = "<redacted>"
+			}
+			logger.Printf("  → extra header: %s: %s", h.name, val)
+		}
 	}
 	if *exactDomain {
 		logger.Printf("  → subdomain masking: disabled (-exact-domain)")
@@ -233,7 +273,50 @@ func proxyAddr(listenAddr string, port int) string {
 	return fmt.Sprintf("%s:%d", host, port)
 }
 
-// loadReplaceFile reads a replacement-pairs file and returns a comma-separated
+// parseHeaders converts the raw "-header Name: Value" strings collected by
+// headerFlag into []headerPair, validating each entry.
+//
+// Validation:
+//   - "Name: Value" format required (SplitN on first ":")
+//   - Name must be a valid HTTP header token (non-empty, no control chars)
+//   - Name is normalised with http.CanonicalHeaderKey
+//   - Hop-by-hop headers are rejected (they are transport-managed)
+//   - Value must be non-empty after trimming
+func parseHeaders(raw []string) ([]headerPair, error) {
+	pairs := make([]headerPair, 0, len(raw))
+	for _, s := range raw {
+		parts := strings.SplitN(s, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid format %q — expected \"Name: Value\"", s)
+		}
+		name := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if name == "" {
+			return nil, fmt.Errorf("header name must not be empty in %q", s)
+		}
+		if value == "" {
+			return nil, fmt.Errorf("header value must not be empty in %q", s)
+		}
+		// Reject characters that are illegal in HTTP header names (RFC 7230 token).
+		for _, c := range name {
+			if c <= 32 || c >= 127 || strings.ContainsRune(`"(),/:;<=>?@[\]{}`, c) {
+				return nil, fmt.Errorf("header name %q contains invalid character %q", name, c)
+			}
+		}
+		// Reject CRLF injection in values.
+		if strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("header value for %q contains illegal CR or LF", name)
+		}
+		name = http.CanonicalHeaderKey(name)
+		if hopByHopHeaders[name] {
+			return nil, fmt.Errorf("header %q is a hop-by-hop header and cannot be injected", name)
+		}
+		pairs = append(pairs, headerPair{name: name, value: value})
+	}
+	return pairs, nil
+}
+
+
 // spec string suitable for NewReplacer.
 //
 // File format (one pair per line):

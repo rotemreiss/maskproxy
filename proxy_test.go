@@ -100,7 +100,7 @@ func newProxy(t *testing.T, upstream *httptest.Server, replaceSpec string) *http
 	if err != nil {
 		t.Fatalf("NewReplacer: %v", err)
 	}
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger())
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil)
 	return httptest.NewServer(proxy)
 }
 
@@ -135,7 +135,7 @@ func TestProxyRequestURLReplacement(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme,ctfd:foo", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger())
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -180,7 +180,7 @@ func TestProxyBinaryNotRewritten(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger())
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -235,7 +235,7 @@ func TestProxyLargeBodySkipsRewrite(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme", false) // no matches in body, but rewrite path is triggered
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger())
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -298,7 +298,7 @@ func TestProxyHostMasking(t *testing.T) {
 	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false) // no user replacements; masking alone is under test
 	const fakeProxyAddr = "masked.proxy:9999"
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, fakeProxyAddr, true, 0, testLogger())
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, fakeProxyAddr, true, 0, testLogger(), nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -352,7 +352,7 @@ func TestProxyHostMaskingWithUserReplacements(t *testing.T) {
 	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme,ctfd:foo", false)
 	const fakeProxyAddr = "masked.proxy:9999"
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, fakeProxyAddr, true, 0, testLogger())
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, fakeProxyAddr, true, 0, testLogger(), nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -397,7 +397,7 @@ func TestProxySetCookieRewrite(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger())
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -587,7 +587,7 @@ func TestSSRFBlockedViaSdPath(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", false, 0, testLogger())
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -653,7 +653,7 @@ func TestHEADRequestNoGzipError(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", false, 0, testLogger())
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -829,7 +829,7 @@ func TestSubdomainRootRelativeIntegration(t *testing.T) {
 	rt := &fixedHostTransport{upstream: upstream}
 
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(rootHost, "http", rep, false, "localhost:9999", false, 0, testLogger())
+	proxy := NewReverseProxy(rootHost, "http", rep, false, "localhost:9999", false, 0, testLogger(), nil)
 	// Override the transport so subdomain requests hit the test upstream.
 	proxy.Transport = rt
 	_ = upstreamHost // used via rt
@@ -886,3 +886,189 @@ func (f *fixedHostTransport) RoundTrip(req *http.Request) (*http.Response, error
 	return resp, err
 }
 
+// ---- Extra upstream headers tests ----
+
+// TestExtraHeadersSentUpstream verifies that headers specified via -header are
+// forwarded on every upstream request and are NOT reflected back to the client.
+func TestExtraHeadersSentUpstream(t *testing.T) {
+	var capturedAuthor, capturedToken string
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuthor = r.Header.Get("X-Author")
+		capturedToken = r.Header.Get("X-Token")
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	extra := []headerPair{
+		{name: "X-Author", value: "Rotem"},
+		{name: "X-Token", value: "secret123"},
+	}
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), extra)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := http.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if capturedAuthor != "Rotem" {
+		t.Errorf("X-Author upstream: got %q want %q", capturedAuthor, "Rotem")
+	}
+	if capturedToken != "secret123" {
+		t.Errorf("X-Token upstream: got %q want %q", capturedToken, "secret123")
+	}
+	// The extra headers must NOT be returned to the client in the response.
+	if got := resp.Header.Get("X-Author"); got != "" {
+		t.Errorf("X-Author leaked to client response: %q", got)
+	}
+}
+
+// TestExtraHeadersOverrideClient verifies that a -header value overrides the
+// same header sent by the client browser.
+func TestExtraHeadersOverrideClient(t *testing.T) {
+	var captured string
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = r.Header.Get("X-Author")
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	extra := []headerPair{{name: "X-Author", value: "ProxyValue"}}
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), extra)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ps.URL+"/", nil)
+	req.Header.Set("X-Author", "ClientValue")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if captured != "ProxyValue" {
+		t.Errorf("X-Author upstream: got %q want %q (proxy value should override client)", captured, "ProxyValue")
+	}
+}
+
+// TestExtraHeadersMultiple verifies that all headers from multiple -header
+// flags are present on the upstream request.
+func TestExtraHeadersMultiple(t *testing.T) {
+	captured := make(map[string]string)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, name := range []string{"X-A", "X-B", "X-C"} {
+			captured[name] = r.Header.Get(name)
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	extra := []headerPair{
+		{name: "X-A", value: "alpha"},
+		{name: "X-B", value: "beta"},
+		{name: "X-C", value: "gamma"},
+	}
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), extra)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := http.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	for name, want := range map[string]string{"X-A": "alpha", "X-B": "beta", "X-C": "gamma"} {
+		if got := captured[name]; got != want {
+			t.Errorf("%s: got %q want %q", name, got, want)
+		}
+	}
+}
+
+// TestParseHeaders verifies the parseHeaders validation function.
+func TestParseHeaders(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   []string
+		wantErr bool
+		wantLen int
+	}{
+		{
+			name:    "single valid header",
+			input:   []string{"X-Author: Rotem"},
+			wantLen: 1,
+		},
+		{
+			name:    "multiple valid headers",
+			input:   []string{"X-Author: Rotem", "X-Token: abc123"},
+			wantLen: 2,
+		},
+		{
+			name:    "value with colon preserved",
+			input:   []string{"Authorization: Bearer tok:en"},
+			wantLen: 1,
+		},
+		{
+			name:    "canonical name applied",
+			input:   []string{"x-author: Rotem"},
+			wantLen: 1,
+		},
+		{
+			name:    "missing colon",
+			input:   []string{"X-Author"},
+			wantErr: true,
+		},
+		{
+			name:    "empty name",
+			input:   []string{": value"},
+			wantErr: true,
+		},
+		{
+			name:    "empty value",
+			input:   []string{"X-Author: "},
+			wantErr: true,
+		},
+		{
+			name:    "hop-by-hop rejected",
+			input:   []string{"Connection: keep-alive"},
+			wantErr: true,
+		},
+		{
+			name:    "CRLF injection in value",
+			input:   []string{"X-Injected: foo\r\nX-Evil: bar"},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pairs, err := parseHeaders(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got nil (pairs=%v)", pairs)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(pairs) != tc.wantLen {
+				t.Errorf("got %d pairs, want %d", len(pairs), tc.wantLen)
+			}
+		})
+	}
+}

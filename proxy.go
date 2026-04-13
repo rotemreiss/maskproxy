@@ -15,6 +15,25 @@ import (
 	"time"
 )
 
+// headerPair holds a pre-parsed upstream header name and value supplied via
+// the -header flag.  Parsing at construction time avoids allocations on the
+// hot path (once per request in the director).
+type headerPair struct{ name, value string }
+
+// hopByHopHeaders is the set of headers that must NOT be set manually because
+// they are managed by the HTTP transport layer.  Injecting them causes protocol
+// errors or undefined behaviour.
+var hopByHopHeaders = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Te":                  true,
+	"Trailers":            true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+}
+
 // absURLRe matches absolute and protocol-relative URLs (used to protect
 // external links from being corrupted by user-defined string replacements).
 var absURLRe = regexp.MustCompile(`(?:https?:)?//[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,}[^\s"'<>\x00-\x1F]*`)
@@ -481,7 +500,7 @@ func unmaskRequestString(s, targetHost, scheme, proxyAddr string) string {
 //
 // logger handles all per-request and startup logging; pass a Logger constructed
 // with NewLogger.
-func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger) *httputil.ReverseProxy {
+func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger, extraHeaders []headerPair) *httputil.ReverseProxy {
 	target := &url.URL{Scheme: scheme, Host: targetHost}
 
 	// Build a single regex that matches the scheme+host prefix of any subdomain
@@ -649,6 +668,14 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// would reach ModifyResponse compressed and corrupt after string replacement.
 		req.Header.Del("Accept-Encoding")
 		req.Header.Add("Accept-Encoding", "gzip, identity")
+
+		// Inject user-defined extra headers (from -header flags).  Use Set so
+		// that if the client also sent the same header, our value wins.  This
+		// runs after all other header rewrites so these values are sent as-is
+		// to the upstream (no alias→original substitution applied to them).
+		for _, h := range extraHeaders {
+			req.Header.Set(h.name, h.value)
+		}
 
 		// Strip client-supplied X-Forwarded-For to prevent header injection.
 		req.Header.Del("X-Forwarded-For")
