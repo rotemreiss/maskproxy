@@ -2926,6 +2926,45 @@ func TestSubdomainSPAScriptInjected(t *testing.T) {
 	if !strings.Contains(bodyStr, "window.WebSocket") {
 		t.Errorf("WebSocket patching not found in injected script:\n%s", bodyStr)
 	}
+	if !strings.Contains(bodyStr, "EventSource") {
+		t.Errorf("EventSource patching not found in injected script:\n%s", bodyStr)
+	}
+}
+
+// TestSubdomainSPAScriptNonceInjected verifies that when the page has existing
+// <script nonce="..."> tags, the injected SPA script gets the same nonce so
+// it is not blocked by nonce-based CSP policies.
+func TestSubdomainSPAScriptNonceInjected(t *testing.T) {
+	const subHost = "copilot.example.com"
+	const testNonce = "abc123xyz"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<!DOCTYPE html><html><head><title>App</title></head><body>`+
+			`<script nonce="%s">var x=1;</script></body></html>`, testNonce)
+	}))
+	defer upstream.Close()
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy("example.com", "http", rep, false, "localhost:9047", false, 0, testLogger(), nil, nil, 0)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	req, _ := http.NewRequest("GET", ps.URL+"/__sd__/"+subHost+"/", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	bodyStr := string(body)
+	wantNonce := `<script nonce="` + testNonce + `">`
+	if !strings.Contains(bodyStr, wantNonce) {
+		t.Errorf("SPA script missing nonce %q.\ngot:\n%s", testNonce, bodyStr)
+	}
 }
 
 // TestSubdomainSPAScriptNotInjectedForMainTarget verifies that the SPA script

@@ -112,6 +112,12 @@ var sriIntegrityRe = regexp.MustCompile(`(?i)\s+integrity\s*=\s*(?:"[^"]*"|'[^']
 // browser would reject the preloaded bytes.  Strip it unconditionally.
 var linkIntegrityRe = regexp.MustCompile(`(?i);\s*integrity\s*=\s*(?:"[^"]*"|'[^']*'|[^\s;,>]*)`)
 
+// scriptNonceRe extracts the nonce value from a <script nonce="..."> attribute.
+// Used to apply the same nonce to the injected SPA script so it is not blocked
+// by nonce-based Content-Security-Policy directives.
+// Group 1 = the nonce value (without quotes).
+var scriptNonceRe = regexp.MustCompile(`(?i)<script[^>]+\bnonce\s*=\s*(?:"([^"]*)"|'([^']*)')`)
+
 // maxBodyRewriteDefault is the default maximum body size for rewriting.
 const maxBodyRewriteDefault = int64(50 * 1024 * 1024) // 50 MiB
 
@@ -132,7 +138,7 @@ const maxBodyRewriteDefault = int64(50 * 1024 * 1024) // 50 MiB
 // accidentally route to the main proxy target.
 //
 // %s is replaced with the /__sd__/<host> prefix (e.g. "/__sd__/copilot.microsoft.com").
-const subdomainSPAScript = `<script>(function(){var pfx=%q;if(!location.pathname.startsWith(pfx))return;var path=location.pathname.slice(pfx.length)||'/';history.replaceState(history.state,document.title,path+location.search+location.hash);['pushState','replaceState'].forEach(function(fn){var o=history[fn].bind(history);history[fn]=function(st,ti,url){if(typeof url==='string'&&url.startsWith('/')&&!url.startsWith('/__sd__/'))url=pfx+url;return o(st,ti,url);};});var oF=window.fetch;window.fetch=function(i,o){if(typeof i==='string'&&i.startsWith('/')&&!i.startsWith('/__sd__/'))i=pfx+i;return oF.call(this,i,o);};var oX=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/'))u=pfx+u;return oX.apply(this,arguments);};var WS=window.WebSocket;window.WebSocket=function(u,p){if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/')){var sch=location.protocol==='https:'?'wss://':'ws://';u=sch+location.host+pfx+u;}return p!==undefined?new WS(u,p):new WS(u);};window.WebSocket.prototype=WS.prototype;})();</script>`
+const subdomainSPAScript = `<script>(function(){var pfx=%q;if(!location.pathname.startsWith(pfx))return;var path=location.pathname.slice(pfx.length)||'/';history.replaceState(history.state,document.title,path+location.search+location.hash);['pushState','replaceState'].forEach(function(fn){var o=history[fn].bind(history);history[fn]=function(st,ti,url){if(typeof url==='string'&&url.startsWith('/')&&!url.startsWith('/__sd__/'))url=pfx+url;return o(st,ti,url);};});var oF=window.fetch;window.fetch=function(i,o){if(typeof i==='string'&&i.startsWith('/')&&!i.startsWith('/__sd__/'))i=pfx+i;return oF.call(this,i,o);};var oX=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/'))u=pfx+u;return oX.apply(this,arguments);};var WS=window.WebSocket;window.WebSocket=function(u,p){if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/')){var sch=location.protocol==='https:'?'wss://':'ws://';u=sch+location.host+pfx+u;}return p!==undefined?new WS(u,p):new WS(u);};window.WebSocket.prototype=WS.prototype;if(window.EventSource){var ES=window.EventSource;window.EventSource=function(u,o){if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith('/__sd__/'))u=pfx+u;return o!==undefined?new ES(u,o):new ES(u);};}})();</script>`
 
 // headTagRe matches an opening <head> tag (with optional attributes) to find
 // the injection point for the subdomain SPA script.
@@ -1837,6 +1843,21 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		if isSubdomain && strings.HasPrefix(contentType, "text/html") {
 			pfx := subdomainPrefix + reqHost // e.g. "/__sd__/copilot.microsoft.com"
 			script := fmt.Sprintf(subdomainSPAScript, pfx)
+
+			// If the page uses nonce-based CSP (script-src 'nonce-xxx'), the browser
+			// will block our injected <script> because it has no nonce attribute.
+			// Extract any nonce from existing <script nonce="..."> tags and add it
+			// to the injected script so CSP allows it to run.
+			if m := scriptNonceRe.FindStringSubmatch(rewritten); m != nil {
+				nonce := m[1]
+				if nonce == "" {
+					nonce = m[2] // single-quoted form
+				}
+				if nonce != "" {
+					script = strings.Replace(script, "<script>", `<script nonce="`+nonce+`">`, 1)
+				}
+			}
+
 			rewritten = headTagRe.ReplaceAllStringFunc(rewritten, func(tag string) string {
 				return tag + script
 			})
