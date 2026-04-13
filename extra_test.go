@@ -3048,3 +3048,54 @@ resp.Body.Close()
 		t.Errorf("ACAO contains path component (not a bare origin): %q", acao)
 	}
 }
+
+// TestBaseHrefSubdomainRewrite verifies that <base href> on subdomain pages
+// is rewritten to point to /__sd__/<host>/ so relative URLs resolve correctly.
+func TestBaseHrefSubdomainRewrite(t *testing.T) {
+	const subHost = "assets.example.com"
+	cases := []struct {
+		name    string
+		body    string
+		wantPfx string
+	}{
+		{
+			name:    "absolute proxy base",
+			body:    `<html><head><base href="http://PROXYADDR/"></head></html>`,
+			wantPfx: "/__sd__/" + subHost,
+		},
+		{
+			name:    "root-relative slash",
+			body:    `<html><head><base href="/"></head></html>`,
+			wantPfx: "/__sd__/" + subHost,
+		},
+		{
+			name:    "root-relative path",
+			body:    `<html><head><base href="/app/"></head></html>`,
+			wantPfx: "/__sd__/" + subHost + "/app/",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/html")
+				fmt.Fprint(w, tc.body)
+			}))
+			defer upstream.Close()
+			rep, _ := NewReplacer("", false)
+			proxy := NewReverseProxy("example.com", "http", rep, false, "localhost:9049", false, 0, testLogger(), nil, nil, 0)
+			proxy.Transport = &fixedHostTransport{upstream: upstream}
+			ps := httptest.NewServer(proxy)
+			defer ps.Close()
+			req, _ := http.NewRequest("GET", ps.URL+"/__sd__/"+subHost+"/", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if !strings.Contains(string(body), tc.wantPfx) {
+				t.Errorf("base href missing %q; got: %s", tc.wantPfx, body)
+			}
+		})
+	}
+}

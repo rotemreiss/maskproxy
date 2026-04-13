@@ -88,6 +88,17 @@ var rootRelativeCSSRe = regexp.MustCompile(`(?i)(url\s*\(\s*["']?)(/[^"')<>\s]*)
 // Group 2 = the root-relative path (starts with /).
 var metaRefreshRe = regexp.MustCompile(`(?i)(content\s*=\s*["'][0-9]+\s*;\s*url=)(/[^"'<>\s]*)`)
 
+// baseHrefRe matches a <base href="..."> tag in HTML.
+// After maskResponseString, an upstream absolute base URL such as
+// "https://copilot.microsoft.com/" is already rewritten to "http://localhost:PORT/".
+// For subdomain pages we must further rewrite it to "http://localhost:PORT/__sd__/<host>/"
+// so the browser resolves relative (non-root-relative) asset paths against the correct
+// subdomain route rather than the proxy root.
+// Group 1 = everything up to and including href= plus opening quote.
+// Group 2 = the URL value (may be absolute or root-relative).
+// Group 3 = the closing quote.
+var baseHrefRe = regexp.MustCompile(`(?i)(<base[^>]+\bhref\s*=\s*)(["'])([^"']*)(["'])`)
+
 // linkHeaderRe matches root-relative URLs inside Link header angle brackets.
 // Format: `</path/to/resource>; rel=preload`
 // Group 1 = the root-relative path (the part between < and >).
@@ -1906,6 +1917,33 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		isSubdomain := !strings.EqualFold(reqHost, targetHost) && reqHost != ""
 		if isSubdomain {
 			rewritten = rewriteRootRelativePaths(rewritten, reqHost)
+			// Rewrite <base href> so relative (non-root-relative) URLs resolve
+			// against the subdomain route.  maskResponseString already turned
+			// "https://host/" into "http://proxyAddr/" so we just need to
+			// prefix any proxy-base or root-relative href with /__sd__/<host>/.
+			if strings.HasPrefix(contentType, "text/html") {
+				sdPfx := subdomainPrefix + reqHost // "/__sd__/host.com"
+				proxyBase := "http://" + effectiveProxyAddr
+				rewritten = baseHrefRe.ReplaceAllStringFunc(rewritten, func(m string) string {
+					sub := baseHrefRe.FindStringSubmatch(m)
+					if len(sub) < 5 {
+						return m
+					}
+					pre, q1, href, q2 := sub[1], sub[2], sub[3], sub[4]
+					// Already pointing into /__sd__/ — leave it.
+					if strings.Contains(href, subdomainPrefix) {
+						return m
+					}
+					// Absolute proxy base URL → replace with subdomain base.
+					if strings.HasPrefix(href, proxyBase) {
+						href = proxyBase + sdPfx + href[len(proxyBase):]
+					} else if strings.HasPrefix(href, "/") && !strings.HasPrefix(href, "//") {
+						// Root-relative href → prefix with /__sd__/<host>.
+						href = sdPfx + href
+					}
+					return pre + q1 + href + q2
+				})
+			}
 		}
 
 		// Pass 2b: for subdomain HTML pages inject the SPA pathname-patching
