@@ -488,7 +488,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		if isGzip {
 			gz, err := gzip.NewReader(resp.Body)
 			if err != nil {
-				log.Printf("ctfproxy: failed to decode gzip response: %v", err)
+				log.Printf("maskproxy: failed to decode gzip response: %v", err)
 				return nil
 			}
 			defer gz.Close()
@@ -507,7 +507,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// For gzip, the compressed stream is already partially consumed and cannot
 		// be reconstructed; we forward the decompressed portion and log a warning.
 		if int64(len(raw)) > maxBodyRewrite {
-			log.Printf("ctfproxy: response body exceeds %d bytes; skipping rewrite", maxBodyRewrite)
+			log.Printf("maskproxy: response body exceeds %d bytes; skipping rewrite", maxBodyRewrite)
 			if isGzip {
 				resp.Body = io.NopCloser(strings.NewReader(string(raw)))
 			} else {
@@ -540,7 +540,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	}
 
 	errorHandler := func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("ctfproxy: upstream error for %s %s: %v", r.Method, r.URL, err)
+		log.Printf("maskproxy: upstream error for %s %s: %v", r.Method, r.URL, err)
 		http.Error(w, "Bad Gateway: "+err.Error(), http.StatusBadGateway)
 	}
 
