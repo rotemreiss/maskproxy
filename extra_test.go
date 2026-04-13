@@ -163,14 +163,17 @@ func TestWithExternalURLsProtected(t *testing.T) {
 		}
 	})
 
-	t.Run("__sd__ host segment protected", func(t *testing.T) {
+	t.Run("__sd__ host segment gets replacement applied", func(t *testing.T) {
+		// /__sd__/ paths ARE proxy-local (not shielded), so user replacements apply.
+		// The director's ToOriginal restores the real host for routing, so this
+		// is safe and required for consistent client-visible URLs.
 		in := `<a href="http://localhost:9002/__sd__/api.ynet.co.il/data">x</a>`
 		got := withExternalURLsProtected(in, "http://localhost:9002", replace)
-		if strings.Contains(got, "/__sd__/api.news.co.il/") {
-			t.Errorf("__sd__ host corrupted: %q", got)
+		if !strings.Contains(got, "/__sd__/api.news.co.il/") {
+			t.Errorf("__sd__ host not replaced: %q", got)
 		}
-		if !strings.Contains(got, "/__sd__/api.ynet.co.il/") {
-			t.Errorf("__sd__ host lost: %q", got)
+		if strings.Contains(got, "/__sd__/api.ynet.co.il/") {
+			t.Errorf("__sd__ host unexpectedly unchanged: %q", got)
 		}
 	})
 
@@ -988,10 +991,11 @@ func TestProxyUserReplacementInLocationHeader(t *testing.T) {
 	}
 }
 
-// TestProxySubdomainUserReplaceNotCorruptedInBody verifies the full pipeline:
-// a subdomain URL that gets encoded into /__sd__/ must NOT have the encoded
-// hostname corrupted by subsequent user alias replacements.
-func TestProxySubdomainUserReplaceNotCorruptedInBody(t *testing.T) {
+// TestProxySubdomainUserReplaceAppliedInBody verifies the full pipeline:
+// a subdomain URL encoded into /__sd__/ SHOULD have the user alias replacement
+// applied so that the client-visible URL is consistent with the alias.
+// The director's rep.ToOriginal restores the real host for routing.
+func TestProxySubdomainUserReplaceAppliedInBody(t *testing.T) {
 	const rootHost = "ynet.co.il"
 
 	// Upstream that returns a subdomain URL in its response body.
@@ -1020,12 +1024,13 @@ func TestProxySubdomainUserReplaceNotCorruptedInBody(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	got := string(body)
 
-	// The /__sd__/ path must use the real hostname — NOT the aliased one.
-	if strings.Contains(got, "/__sd__/pic.news.co.il/") {
-		t.Errorf("/__sd__/ host was corrupted by user replacement: %q", got)
+	// The /__sd__/ path SHOULD use the aliased hostname so URLs are consistent.
+	// (The director restores the original hostname for routing via rep.ToOriginal.)
+	if !strings.Contains(got, "/__sd__/pic.news.co.il/") {
+		t.Errorf("/__sd__/ host not replaced with alias: %q", got)
 	}
-	if !strings.Contains(got, "/__sd__/pic.ynet.co.il/") {
-		t.Errorf("/__sd__/ path not found or incorrectly rewritten: %q", got)
+	if strings.Contains(got, "/__sd__/pic.ynet.co.il/") {
+		t.Errorf("/__sd__/ path still uses original hostname: %q", got)
 	}
 }
 

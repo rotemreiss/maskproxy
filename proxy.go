@@ -132,30 +132,20 @@ var textContentTypes = []string{
 //
 // proxyBase is the scheme+host prefix of the proxy (e.g. "http://localhost:8081").
 // URLs starting with proxyBase are NOT protected so user replacements still apply
-// to proxy-local paths (e.g. "/ctf/page" → "/acme/page").
+// to proxy-local paths including /__sd__/<host> segments (e.g. "microsoft" in
+// "/__sd__/copilot.microsoft.com/" becomes "msctf" when -replace microsoft:msctf).
+// The director applies rep.ToOriginal on every inbound request path, so the encoded
+// hostname is restored before routing regardless of what the client URL contains.
 // When proxyBase is "" (host masking disabled), all absolute URLs are protected.
 //
 // Mechanism: each protected URL is temporarily replaced with a NUL-delimited
 // numeric placeholder, fn is applied to the surrounding text, and then every
 // placeholder is swapped back to the original URL.
-//
-// Additionally, /__sd__/<host> segments within proxy-local URLs are specifically
-// shielded so that user string replacements cannot corrupt the encoded upstream
-// hostname (e.g. "ynet" in "/__sd__/www.ynet.co.il/" must not become "news").
 func withExternalURLsProtected(s, proxyBase string, fn func(string) string) string {
 	type entry struct{ placeholder, original string }
 	var saved []entry
 
-	// Step 1: shield /__sd__/<host> segments BEFORE the external-URL scan.
-	// These encoded upstream hosts live inside proxy-local URLs and must survive
-	// user replacements intact so the director can route correctly.
-	s = subdomainPathRe.ReplaceAllStringFunc(s, func(m string) string {
-		ph := "\x01" + strconv.Itoa(len(saved)) + "\x01"
-		saved = append(saved, entry{ph, m})
-		return ph
-	})
-
-	// Step 2: shield external (non-proxy) URLs.
+	// Shield external (non-proxy) absolute URLs.
 	result := absURLRe.ReplaceAllStringFunc(s, func(u string) string {
 		// Keep proxy-local URLs unprotected so their paths are still rewritten.
 		// Check both "http://host" and "//host" (protocol-relative) forms.
@@ -170,11 +160,10 @@ func withExternalURLsProtected(s, proxyBase string, fn func(string) string) stri
 		return ph
 	})
 
-	// Step 3: apply user replacements to everything not shielded.
+	// Apply user replacements to everything not shielded.
 	result = fn(result)
 
-	// Step 4: restore all shielded segments in reverse-insertion order so that
-	// nested or overlapping placeholders resolve correctly.
+	// Restore shielded segments in reverse-insertion order.
 	for i := len(saved) - 1; i >= 0; i-- {
 		result = strings.Replace(result, saved[i].placeholder, saved[i].original, 1)
 	}
