@@ -2589,3 +2589,31 @@ func TestServiceWorkerAllowedStripped(t *testing.T) {
 		t.Errorf("Service-Worker-Allowed not stripped: %q", v)
 	}
 }
+
+// TestClearSiteDataStripped verifies that Clear-Site-Data is removed from
+// responses.  Forwarding it would clear cookies/storage for ALL sites proxied
+// through localhost:PORT, not just the one that sent the header.
+func TestClearSiteDataStripped(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Clear-Site-Data", `"cookies", "storage"`)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "logged out")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp2, err := http.Get(ps.URL + "/logout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+
+	if v := resp2.Header.Get("Clear-Site-Data"); v != "" {
+		t.Errorf("Clear-Site-Data not stripped: %q", v)
+	}
+}

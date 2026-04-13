@@ -110,16 +110,22 @@ maskproxy -target microsoft.com -replace microsoft:msctf \
 - **Inbound responses** (upstream → client): original → alias
 - Pairs are applied **longest-key-first** to prevent partial-match bugs (`ctfd` is always matched before `ctf`).
 - Only **text** content types are rewritten. Binary responses (images, fonts, etc.) pass through unchanged.
-- **gzip-compressed** responses are transparently decompressed, rewritten, and forwarded as plain text.
+- **gzip/deflate-compressed** responses are transparently decompressed, rewritten, and forwarded as plain text.
 
 ## Design notes
 
 - No external dependencies — stdlib only (`net/http/httputil`).
 - `Content-Length` is recalculated after every body rewrite.
-- `Accept-Encoding` on outbound requests is limited to `gzip, identity` so only supported encodings reach the upstream.
+- `Accept-Encoding` on outbound requests is limited to `gzip, deflate, identity` so only supported encodings reach the upstream.
 - `X-Forwarded-For` from the client is stripped to prevent header injection.
-- **HSTS and key-pinning headers** are stripped unconditionally so the browser never locks on to the upstream's TLS policy.
+- **Conditional requests** (`If-None-Match`, `If-Modified-Since`, `If-Match`, etc.) are stripped outbound and `ETag`/`Last-Modified` are stripped from responses, ensuring upstream always returns a full body that goes through rewriting.
+- **HSTS, key-pinning, Report-To, NEL, COOP, COEP, CORP, and Clear-Site-Data headers** are stripped so the browser never locks on to the upstream's security policy or sends telemetry to upstream endpoints.
+- **SRI `integrity` attributes** are stripped from HTML `<script>` and `<link>` tags, and `integrity=` parameters are stripped from `Link` response headers — after string replacement the precomputed hash is stale.
+- **`__Host-`/`__Secure-` cookie name prefixes** are stripped when the proxy runs on plain HTTP, since those prefixes require the `Secure` attribute that we must remove.
+- **Service-Worker-Allowed** response header is stripped to prevent a service worker registered under `/__sd__/<host>/` from claiming the entire proxy origin.
+- **`text/event-stream` (SSE)** responses are streamed directly without buffering — headers are still rewritten.
 - **WebSocket** connections are transparently proxied. WS frames are not string-replaced (binary framing), but opcodes and payload lengths are logged to stderr by default (`-ws-no-log` suppresses this).
 - **Subdomain routing**: upstream subdomains are encoded as `/__sd__/<subdomain>/path` in the proxy URL so the browser never needs to know about them directly.
+- **SSRF guard**: only subdomains of the configured root domain are allowed through `/__sd__/`; hostnames containing `@` or path separators are rejected with HTTP 400.
 - **Graceful shutdown**: Ctrl+C / SIGTERM drains in-flight requests for up to `-drain` seconds before exiting.
 - **Replacement count** is logged on every request/response line so you can confirm replacements are firing without enabling `-verbose`.

@@ -170,6 +170,13 @@ var headersStrip = map[string]bool{
 	// requests.  Strip the header so the SW scope is limited to its own path.
 	"Service-Worker-Allowed": true,
 
+	// Clear-Site-Data: instructs the browser to clear cookies, storage, or
+	// cache for the current origin.  Since all proxied sites share
+	// localhost:PORT as their origin, forwarding this header from one site's
+	// logout endpoint would wipe the cookies and storage of every other site
+	// being proxied simultaneously.  Strip it unconditionally.
+	"Clear-Site-Data": true,
+
 	// ETag and Last-Modified enable conditional requests (If-None-Match /
 	// If-Modified-Since).  If the browser cached a previous proxy response and
 	// later sends a conditional GET, the upstream would return 304 Not Modified,
