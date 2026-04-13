@@ -357,6 +357,16 @@ var headersStrip = map[string]bool{
 	// sites share localhost:PORT, a restrictive policy from one site would apply
 	// globally to every other proxied site on the same origin.  Strip it.
 	"Document-Policy": true,
+
+	// Accept-CH and Critical-CH instruct browsers to send Client Hint request
+	// headers (Sec-CH-UA, Sec-CH-UA-Platform, Viewport-Width, DPR, etc.) on
+	// subsequent requests to this origin.  Since the browser's "origin" is
+	// localhost:PORT (the proxy), accepting Client Hints would cause the browser
+	// to advertise the proxy's origin context in future requests — not the upstream
+	// context.  Strip both to avoid leaking proxy fingerprint data to upstream.
+	"Accept-Ch":          true,
+	"Accept-Ch-Lifetime": true, // deprecated but still seen in the wild
+	"Critical-Ch":        true,
 }
 
 // textContentTypes lists MIME type prefixes for which body replacement is safe.
@@ -1645,6 +1655,24 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		req.Header.Del("Sec-Fetch-Mode")
 		req.Header.Del("Sec-Fetch-Dest")
 		req.Header.Del("Sec-Fetch-User")
+
+		// Strip Client Hints request headers.  The browser sends these because a
+		// previous response from this origin contained Accept-CH (now stripped on
+		// responses).  The values describe the browser's UA, platform, device, etc.
+		// relative to the proxy origin — meaningless to upstream and leaking metadata.
+		req.Header.Del("Sec-Ch-Ua")
+		req.Header.Del("Sec-Ch-Ua-Mobile")
+		req.Header.Del("Sec-Ch-Ua-Platform")
+		req.Header.Del("Sec-Ch-Ua-Platform-Version")
+		req.Header.Del("Sec-Ch-Ua-Full-Version")
+		req.Header.Del("Sec-Ch-Ua-Full-Version-List")
+		req.Header.Del("Sec-Ch-Ua-Arch")
+		req.Header.Del("Sec-Ch-Ua-Bitness")
+		req.Header.Del("Sec-Ch-Ua-Model")
+		req.Header.Del("Sec-Ch-Ua-Wow64")
+		req.Header.Del("Dpr")
+		req.Header.Del("Viewport-Width")
+		req.Header.Del("Width")
 
 		// Strip Upgrade-Insecure-Requests.  This header asks upstream to redirect
 		// HTTP requests to HTTPS.  When the proxy is talking HTTP to upstream (non-
