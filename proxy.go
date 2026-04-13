@@ -498,6 +498,23 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			start = v.(time.Time)
 		}
 
+		// ── Redirect downgrade: 301 → 302, 308 → 307 ────────────────────────
+		// Browsers cache 301/308 (permanent) redirects indefinitely.  The
+		// Location URLs the proxy emits contain proxy-internal path prefixes
+		// (/__sd__/…) and localhost addresses that are meaningless outside of
+		// the current proxy session.  If the browser caches them and the user
+		// restarts the proxy (or switches targets), those cached redirects will
+		// loop or point to the wrong place.  Downgrading to temporary redirects
+		// prevents any caching.
+		switch resp.StatusCode {
+		case http.StatusMovedPermanently: // 301 → 302
+			resp.StatusCode = http.StatusFound
+			resp.Status = "302 Found"
+		case http.StatusPermanentRedirect: // 308 → 307
+			resp.StatusCode = http.StatusTemporaryRedirect
+			resp.Status = "307 Temporary Redirect"
+		}
+
 		// ── Phase 1: header rewrites — run on EVERY response ─────────────────
 		// Redirects (301/302/307/308) and non-text assets can carry headers that
 		// leak the upstream hostname.  These must be rewritten unconditionally
