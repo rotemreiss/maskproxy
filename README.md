@@ -76,6 +76,21 @@ maskproxy -target <host> [options]
 | `-max-body <n>` | Maximum body size (MiB) to buffer for rewriting (default: `50`). Bodies larger than this are forwarded unchanged. Increase for large HTML pages; decrease to reduce memory usage. |
 | `-drain <duration>` | Grace period to drain in-flight requests on Ctrl+C / SIGTERM (default: `15s`). |
 
+### Traffic inspection UI
+
+| Flag | Description |
+|------|-------------|
+| `-ui-port <n>` | Port for the built-in traffic inspection web UI (default: `4040`). Set to `0` to disable. |
+
+When enabled, open `http://localhost:4040` (or whatever `-listen`/`-ui-port` you chose) in a browser to see:
+
+- A live-updating list of all proxied requests (streamed via SSE)
+- Per-request detail: method, URL, status code, latency, content type, response size
+- Before/after body diff showing exactly which strings were replaced
+- Original and modified request/response headers
+- Aggregated statistics (request count by status class, replacement counts, active hosts)
+- Proxy configuration summary (target, replacement pairs, ignored hosts)
+
 ## Examples
 
 ```bash
@@ -101,6 +116,9 @@ maskproxy -target microsoft.com -replace microsoft:msctf \
 # Proxy a site that loads assets from a separate domain (BBC uses bbci.co.uk and bbc.co.uk)
 maskproxy -target www.bbc.com -replace bbc:britcast \
   -also-proxy bbci.co.uk,bbc.co.uk
+
+# Disable the traffic inspection UI (e.g. for automated/headless use)
+maskproxy -target ctf.io -replace ctf:acme -ui-port 0
 ```
 
 | Direction | Example |

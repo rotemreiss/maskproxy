@@ -4860,3 +4860,33 @@ func TestBuildReplacementPairs(t *testing.T) {
 		t.Errorf("expected baz→qux, got %v", got)
 	}
 }
+
+// TestRewriteRootRelativePathsSpeculationRules verifies that root-relative
+// URL values inside <script type="speculationrules"> blocks are rewritten to
+// go through the subdomain proxy route, just like importmap values.
+func TestRewriteRootRelativePathsSpeculationRules(t *testing.T) {
+	sub := "app.example.com"
+	pfx := "/__sd__/" + sub
+	in := `<script type="speculationrules">{"prefetch":[{"urls":["/news","/sports"]}]}</script>`
+	got := rewriteRootRelativePaths(in, sub)
+	want := `<script type="speculationrules">{"prefetch":[{"urls":["` + pfx + `/news","` + pfx + `/sports"]}]}</script>`
+	if got != want {
+		t.Errorf("speculationrules rewrite:\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestRewriteRootRelativePathsSpeculationRulesAlreadyPrefixed verifies
+// idempotency: already-prefixed values inside speculationrules are not
+// double-prefixed.
+func TestRewriteRootRelativePathsSpeculationRulesAlreadyPrefixed(t *testing.T) {
+	sub := "app.example.com"
+	pfx := "/__sd__/" + sub
+	in := `<script type="speculationrules">{"prefetch":[{"urls":["` + pfx + `/news"]}]}</script>`
+	got := rewriteRootRelativePaths(in, sub)
+	if strings.Contains(got, pfx+pfx) {
+		t.Errorf("double-prefix detected:\n%s", got)
+	}
+	if !strings.Contains(got, pfx+"/news") {
+		t.Errorf("expected %s/news to remain, got:\n%s", pfx, got)
+	}
+}
