@@ -3286,3 +3286,58 @@ t.Errorf("rewriteCSP(%q) [%s]:\n got  %q\n want %q", tc.in, tc.desc, got, tc.wan
 }
 }
 }
+
+// TestSpeculationRulesSubdomainRewrite verifies that root-relative URL values
+// inside <script type="speculationrules"> blocks are prefixed with /__sd__/<host>/
+// on subdomain pages so Chrome's pre-fetch/pre-render targets route through the proxy.
+func TestSpeculationRulesSubdomainRewrite(t *testing.T) {
+	const subHost = "app.example.com"
+	const pageBody = `<!DOCTYPE html><html><head>` +
+		`<script type="speculationrules">{"prefetch":[{"source":"list","urls":["/page-a","/page-b"]}]}</script>` +
+		`</head><body></body></html>`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, pageBody)
+	}))
+	defer upstream.Close()
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy("example.com", "http", rep, false, "localhost:9052", false, 0, testLogger(), nil, nil, 0, nil)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+	req, _ := http.NewRequest("GET", ps.URL+"/__sd__/"+subHost+"/", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	sdPfx := "/__sd__/" + subHost
+	bs := string(respBody)
+	if !strings.Contains(bs, sdPfx+"/page-a") {
+		t.Errorf("speculationrules /page-a not rewritten; got:\n%s", bs)
+	}
+	if !strings.Contains(bs, sdPfx+"/page-b") {
+		t.Errorf("speculationrules /page-b not rewritten; got:\n%s", bs)
+	}
+}
+
+// TestToOriginalDiffEmptyReplacer verifies that ToOriginalDiff returns
+// the input unchanged with count 0 when no pairs are configured.
+func TestToOriginalDiffEmptyReplacer(t *testing.T) {
+	r, _ := NewReplacer("", false)
+	got, count := r.ToOriginalDiff("hello world")
+	if got != "hello world" || count != 0 {
+		t.Errorf("ToOriginalDiff on empty replacer: got %q, %d; want %q, 0", got, count, "hello world")
+	}
+}
+
+// TestToAliasDiffEmptyReplacer verifies that ToAliasDiff returns
+// the input unchanged with count 0 when no pairs are configured.
+func TestToAliasDiffEmptyReplacer(t *testing.T) {
+	r, _ := NewReplacer("", false)
+	got, count := r.ToAliasDiff("hello world")
+	if got != "hello world" || count != 0 {
+		t.Errorf("ToAliasDiff on empty replacer: got %q, %d; want %q, 0", got, count, "hello world")
+	}
+}

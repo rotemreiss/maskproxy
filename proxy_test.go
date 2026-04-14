@@ -1374,3 +1374,52 @@ func TestFollowTargetRedirectsCrossDomain(t *testing.T) {
 		t.Errorf("expected original Location header, got %q", resp.Header.Get("Location"))
 	}
 }
+
+// TestFollowTargetRedirects307 verifies that 307 redirects preserve the HTTP method
+// (unlike 302 which rewrites to GET).
+func TestFollowTargetRedirects307(t *testing.T) {
+	var capturedMethod, capturedPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/submit":
+			// 307 must preserve POST
+			w.Header().Set("Location", "http://"+r.Host+"/final")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		case "/final":
+			capturedMethod = r.Method
+			capturedPath = r.URL.Path
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, "done")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	noRedirectClient := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	req, _ := http.NewRequest(http.MethodPost, ps.URL+"/submit", strings.NewReader("body"))
+	req.Header.Set("Content-Type", "text/plain")
+	resp, err := noRedirectClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 after 307 follow, got %d", resp.StatusCode)
+	}
+	if capturedMethod != http.MethodPost {
+		t.Errorf("307 redirect should preserve POST method, got %q", capturedMethod)
+	}
+	if capturedPath != "/final" {
+		t.Errorf("expected /final, got %q", capturedPath)
+	}
+}
