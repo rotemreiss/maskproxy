@@ -332,15 +332,16 @@ func main() {
 	}
 
 	// Start the UI inspection server on a separate port.
+	// It binds to the same listen address as the main proxy (respects -listen flag).
 	if *uiPort > 0 {
-		uiAddr := fmt.Sprintf("0.0.0.0:%d", *uiPort)
+		uiAddr := fmt.Sprintf("%s:%d", *listen, *uiPort)
 		uiSrv := NewUIServer(trafficStore, uiAddr)
 		go func() {
 			if err := uiSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				logger.Printf("maskproxy: UI server error: %v", err)
 			}
 		}()
-		logger.Printf("  → UI:  http://localhost:%d", *uiPort)
+		logger.Printf("  → UI:  http://%s:%d", *listen, *uiPort)
 	}
 
 	// Use http.Server instead of http.ListenAndServe so we can call Shutdown.
