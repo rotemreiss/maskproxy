@@ -4363,3 +4363,40 @@ if strings.Count(out, "Cache-Control:") != 2 {
 t.Errorf("expected Cache-Control to appear twice for multi-value; got: %q", out)
 }
 }
+
+// TestFollowTargetRedirectSchemeLessLocation verifies that a Location header
+// with no scheme gets the transport scheme applied — exercises
+// the locURL.Scheme == "" branch in followTargetRedirectsTransport.RoundTrip.
+func TestFollowTargetRedirectSchemeLessLocation(t *testing.T) {
+	var redirected bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			// Scheme-less absolute-path Location.
+			w.Header().Set("Location", "/final")
+			w.WriteHeader(http.StatusMovedPermanently)
+			return
+		}
+		redirected = true
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "final")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9800", true, 0, newDiscardLogger(), nil, nil, 0, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 after redirect, got %d", resp.StatusCode)
+	}
+	if !redirected {
+		t.Error("expected redirect to /final to be followed")
+	}
+}
