@@ -135,3 +135,11 @@ maskproxy -target www.bbc.com -replace bbc:britcast \
 - **SSRF guard**: only subdomains of the configured root domain are allowed through `/__sd__/`; hostnames containing `@` or path separators are rejected with HTTP 400.
 - **Graceful shutdown**: Ctrl+C / SIGTERM drains in-flight requests for up to `-drain` seconds before exiting.
 - **Replacement count** is logged on every request/response line so you can confirm replacements are firing without enabling `-verbose`.
+
+## Known limitations
+
+- **JavaScript-constructed URLs with alias token**: if upstream JavaScript builds absolute URLs at runtime using string concatenation from the replaced alias strings (e.g. `"https://api." + hostname`), the browser makes those requests directly with the alias hostname. Since the alias hostname does not exist in DNS, those requests will fail with a DNS error. This is inherent to client-side string replacement — the proxy cannot intercept JavaScript that constructs URLs rather than receiving them in HTML/CSS.
+- **`window.location.hostname`** always returns `localhost` (the proxy address), not the upstream hostname. Pages that validate `location.hostname` at runtime may behave differently through the proxy.
+- **Dynamic `import('/path')`** statements cannot be patched at runtime; only statically-declared imports in `<script type="importmap">` are rewritten. Dynamic root-relative `import()` calls will fail on `/__sd__/` subdomain routes.
+- **WebSocket frame content** is not string-replaced — WS frames use binary framing that cannot be safely modified without re-framing. Replacement applies only to the HTTP upgrade handshake headers.
+- **Third-party analytics/telemetry** endpoints that directly reference external domains will encounter CORS errors since the proxy origin is `localhost`; this is expected and generally harmless for the proxied page's functionality.
