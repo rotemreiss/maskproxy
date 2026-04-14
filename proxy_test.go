@@ -78,6 +78,8 @@ func TestReplacerInvalidPair(t *testing.T) {
 // default when the proxy is invoked without -cs) matches mixed-case strings.
 func TestReplacerCaseInsensitiveDefault(t *testing.T) {
 	// caseInsensitive=true mirrors the production default (!*cs where cs=false).
+	// Replacement always returns the alias as specified (lowercase), regardless
+	// of the case of the matched token in the input.
 	r, _ := NewReplacer("microsoft:msctf", true)
 
 	tests := []struct{ input, want string }{
@@ -90,6 +92,31 @@ func TestReplacerCaseInsensitiveDefault(t *testing.T) {
 		got := r.ToAlias(tc.input)
 		if got != tc.want {
 			t.Errorf("CI ToAlias(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+// TestReplacerCasePreservingRoundTrip verifies the /__sd__/ path-protection
+// mechanism: file names like BBCReithSans_W_Rg.woff2 inside proxy URL paths
+// are shielded from ToAlias by withExternalURLsProtected, so the CDN filename
+// case is preserved end-to-end.  This test checks the replacer behaviour in
+// isolation: ToAlias converts all case variants to the lowercase alias string.
+func TestReplacerCasePreservingRoundTrip(t *testing.T) {
+	r, _ := NewReplacer("bbc:britcast", true)
+
+	// ToAlias is NOT case-preserving — always returns the lowercase alias.
+	// The /__sd__/ path-protection in withExternalURLsProtected ensures the
+	// original filename case is preserved in proxy URLs so the director can
+	// round-trip the exact upstream filename back to the CDN.
+	aliasTests := []struct{ original, alias string }{
+		{"bbc.co.uk", "britcast.co.uk"},
+		{"BBC News", "britcast News"},    // uppercase input → lowercase alias
+		{"static.files.bbci.co.uk", "static.files.britcasti.co.uk"},
+	}
+	for _, tc := range aliasTests {
+		got := r.ToAlias(tc.original)
+		if got != tc.alias {
+			t.Errorf("ToAlias(%q) = %q, want %q", tc.original, got, tc.alias)
 		}
 	}
 }

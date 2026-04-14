@@ -62,6 +62,13 @@ var absURLRe = regexp.MustCompile(`(?:https?:)?//[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-z
 // is not corrupted into "/__sd__/api.localhost:8081/".
 var subdomainPathRe = regexp.MustCompile(`/__sd__/[^\s"'<>\x00-\x1F]+`)
 
+// sdPathPortionRe captures the path portion of a /__sd__/<host><path> segment
+// separately from the host so that withExternalURLsProtected can protect just
+// the path (file names, opaque slugs) from user string replacement while still
+// allowing the host part to be aliased.
+// Group 1 = "/__sd__/<host>" (no trailing slash), Group 2 = "/<path>…".
+var sdPathPortionRe = regexp.MustCompile(`(/__sd__/[^/?#"'\s<>\x00-\x1F]+)(/[^"'\s<>\x00-\x1F]+)`)
+
 // rootRelativeAttrRe matches HTML attribute values that are root-relative paths
 // (start with "/" but not "//" or "/__sd__/").
 // Group 1 = attribute name + "=" + opening quote (e.g. `href="`).
@@ -448,6 +455,23 @@ func withExternalURLsProtected(s, proxyBase string, fn func(string) string) stri
 		ph := "\x00" + strconv.Itoa(len(saved)) + "\x00"
 		saved = append(saved, entry{ph, u})
 		return ph
+	})
+
+	// Protect the PATH portion of /__sd__/<host><path> proxy-local URLs.
+	// The host portion (e.g. "bbci.co.uk") is left unprotected so ToAlias can
+	// alias it (bbci → britcasti), but the path (e.g. "/fonts/BBCReithSans.woff2")
+	// is shielded so that file names with the original-case token are not corrupted
+	// by user replacement. This ensures the correct CDN filename is round-tripped
+	// through the director's ToOriginal pass even when CDN files use mixed-case
+	// names (e.g. BBCReithSans) that differ from the lowercase key in -replace.
+	result = sdPathPortionRe.ReplaceAllStringFunc(result, func(m string) string {
+		sub := sdPathPortionRe.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		ph := "\x00p" + strconv.Itoa(len(saved)) + "\x00"
+		saved = append(saved, entry{ph, sub[2]})
+		return sub[1] + ph // keep /__sd__/host; protect /path
 	})
 
 	// Apply user replacements to everything not shielded.

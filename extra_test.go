@@ -199,9 +199,8 @@ func TestWithExternalURLsProtected(t *testing.T) {
 	})
 
 	t.Run("__sd__ host segment gets replacement applied", func(t *testing.T) {
-		// /__sd__/ paths ARE proxy-local (not shielded), so user replacements apply.
-		// The director's ToOriginal restores the real host for routing, so this
-		// is safe and required for consistent client-visible URLs.
+		// The /__sd__/ HOST is replaced so the browser sees the aliased hostname.
+		// The PATH is shielded to preserve exact CDN filenames for correct routing.
 		in := `<a href="http://localhost:9002/__sd__/api.ynet.co.il/data">x</a>`
 		got := withExternalURLsProtected(in, "http://localhost:9002", replace)
 		if !strings.Contains(got, "/__sd__/api.news.co.il/") {
@@ -209,6 +208,29 @@ func TestWithExternalURLsProtected(t *testing.T) {
 		}
 		if strings.Contains(got, "/__sd__/api.ynet.co.il/") {
 			t.Errorf("__sd__ host unexpectedly unchanged: %q", got)
+		}
+	})
+
+	t.Run("__sd__ path preserved to protect CDN filenames", func(t *testing.T) {
+		// The path portion of a /__sd__/ URL must NOT have ToAlias applied.
+		// This ensures CDN files whose names contain the original-case token
+		// (e.g. "BBCReithSans_W_Rg.woff2" when -replace bbc:britcast) are not
+		// corrupted, preventing 404s when the director reverses the alias.
+		bReplace := func(s string) string {
+			return strings.ReplaceAll(s, "bbc", "britcast")
+		}
+		in := `src="http://localhost:9002/__sd__/static.files.bbci.co.uk/fonts/BBCReithSans_W_Rg.woff2"`
+		got := withExternalURLsProtected(in, "http://localhost:9002", bReplace)
+		// Host "bbci.co.uk" should be aliased.
+		if !strings.Contains(got, "britcasti.co.uk") {
+			t.Errorf("__sd__ host not aliased: %q", got)
+		}
+		// Path filename "BBCReithSans_W_Rg.woff2" should be preserved exactly.
+		if !strings.Contains(got, "BBCReithSans_W_Rg.woff2") {
+			t.Errorf("CDN filename corrupted in __sd__ path: %q", got)
+		}
+		if strings.Contains(got, "britcastReithSans") {
+			t.Errorf("CDN filename was aliased (should be protected): %q", got)
 		}
 	})
 
