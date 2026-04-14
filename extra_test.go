@@ -4328,3 +4328,38 @@ if !strings.Contains(got, "ping") {
 t.Errorf("expected ping frame in log after payload skip, got: %q", got)
 }
 }
+
+// TestLogWSFrameUnknownOpcode verifies that an unknown opcode is formatted as
+// "0xN" instead of the named form.
+func TestLogWSFrameUnknownOpcode(t *testing.T) {
+var buf strings.Builder
+lg := wsLogger(&buf)
+// Opcode 0x3 is reserved/unknown in RFC 6455.
+lg.LogWSFrame(1, "WS↓", 0x3, true, false, 10)
+if !strings.Contains(buf.String(), "0x3") {
+t.Errorf("expected 0x3 opcode name; got: %q", buf.String())
+}
+}
+
+// TestLogResponseVerboseMultiValueHeader verifies that LogResponse verbose mode
+// logs each value in a multi-valued header on its own line.
+func TestLogResponseVerboseMultiValueHeader(t *testing.T) {
+var buf strings.Builder
+lg := &Logger{l: log.New(&buf, "", 0), verbose: true}
+
+req, _ := http.NewRequest("GET", "http://example.com/", nil)
+resp := &http.Response{
+StatusCode:    200,
+ContentLength: 0,
+Header: http.Header{
+"Cache-Control": {"no-store", "no-cache"},
+},
+Request: req,
+}
+lg.LogResponse(resp, "", time.Time{}, 0)
+out := buf.String()
+// Both values should appear as separate lines.
+if strings.Count(out, "Cache-Control:") != 2 {
+t.Errorf("expected Cache-Control to appear twice for multi-value; got: %q", out)
+}
+}
