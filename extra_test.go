@@ -4445,3 +4445,36 @@ func TestUnmaskRequestStringEmptySubHost(t *testing.T) {
 		t.Error("expected non-empty result from unmaskRequestString")
 	}
 }
+
+// TestNewReplacerTrailingCommaSkipsEmptyPart verifies that the empty-part
+// guard in NewReplacer handles specs with trailing or double commas gracefully.
+func TestNewReplacerTrailingCommaSkipsEmptyPart(t *testing.T) {
+	// Spec with trailing comma and double comma both produce empty parts after split.
+	r, err := NewReplacer(",ctf:acme,,", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := r.ToAlias("ctf")
+	if got != "acme" {
+		t.Errorf("expected 'acme', got %q", got)
+	}
+}
+
+// TestReplacerCIMixedCaseInput verifies that the caseInsensitive key lowercasing
+// path is exercised in ToAlias and ToOriginalDiff when the match is upper-case.
+func TestReplacerCIMixedCaseInput(t *testing.T) {
+	// CI mode: lookupResp keys are lowercase; regex is (?i)ctf
+	r, _ := NewReplacer("ctf:acme", true)
+
+	// ToAlias: input "CTF" — regex (?i)ctf matches it, m="CTF", key=ToLower("CTF")="ctf" → "acme"
+	got := r.ToAlias("CTF")
+	if got != "acme" {
+		t.Errorf("ToAlias(CTF) = %q; want acme", got)
+	}
+
+	// ToOriginalDiff: input "ACME" — regex (?i)acme matches it, m="ACME", key="acme" → "ctf"
+	gotStr, count := r.ToOriginalDiff("ACME")
+	if gotStr != "ctf" || count != 1 {
+		t.Errorf("ToOriginalDiff(ACME) = %q, %d; want ctf, 1", gotStr, count)
+	}
+}
