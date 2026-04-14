@@ -31,6 +31,12 @@ Options:
   -replace-file <path>     Path to a file with one original:alias pair per line.
                            Lines starting with '#' and blank lines are ignored.
                            Combined with any -replace pairs (CLI pairs win on conflict).
+  -also-proxy   <domains>  Comma-separated list of extra domains to route via /__sd__/.
+                            Use for CDN/related domains on a different TLD that share
+                            content with -target.  Their URLs are rewritten to
+                            http://localhost:PORT/__sd__/<host>/ so scripts load through
+                            the proxy and receive full string-replacement treatment.
+                            Example: -also-proxy bbci.co.uk,bbc.co.uk
   -ignore-host  <hosts>    Comma-separated list of upstream hostnames to exclude
                             from all proxy rewriting (repeatable).
                             Wildcard prefix "*.domain.com" matches any subdomain.
@@ -157,6 +163,7 @@ func main() {
 	flag.Var(&headers, "header", `Add a header to every upstream request (repeatable). Format: "Name: Value". Example: -header "X-Author: Rotem"`)
 	var ignoreHosts ignoreHostFlag
 	flag.Var(&ignoreHosts, "ignore-host", `Exclude hosts from all proxy rewriting (comma-separated, repeatable). Wildcard "*.domain.com" matches any subdomain. Example: -ignore-host "*.bbci.co.uk,login.microsoftonline.com"`)
+	alsoProxyFlag := flag.String("also-proxy", "", "Comma-separated list of extra domains to route via /__sd__/ (e.g. bbci.co.uk,bbc.co.uk). Use for CDN domains on different TLDs that share content with -target.")
 
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -217,6 +224,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Parse -also-proxy domains.
+	var alsoProxyDomains []string
+	if *alsoProxyFlag != "" {
+		for _, d := range strings.Split(*alsoProxyFlag, ",") {
+			d = strings.TrimSpace(d)
+			if d != "" {
+				alsoProxyDomains = append(alsoProxyDomains, d)
+			}
+		}
+	}
+
 	logger, closeLog, err := NewLogger(*verbose, !*wsNoLog, *logFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -231,7 +249,7 @@ func main() {
 
 	pAddr := proxyAddr(*listen, *port)
 	maxBodyBytes := *maxBody * 1024 * 1024
-	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger, extraHeaders, ignoredHostsMap, maxBodyBytes)
+	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger, extraHeaders, ignoredHostsMap, maxBodyBytes, alsoProxyDomains)
 
 	addr := fmt.Sprintf("%s:%d", *listen, *port)
 	logger.Printf("maskproxy listening on http://%s", addr)
@@ -267,6 +285,9 @@ func main() {
 		}
 		sort.Strings(sorted)
 		logger.Printf("  → ignored hosts (no rewriting): %s", strings.Join(sorted, ", "))
+	}
+	if len(alsoProxyDomains) > 0 {
+		logger.Printf("  → also-proxy domains (routed via /__sd__/): %s", strings.Join(alsoProxyDomains, ", "))
 	}
 	if *exactDomain {
 		logger.Printf("  → subdomain masking: disabled (-exact-domain)")

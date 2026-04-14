@@ -618,6 +618,11 @@ func computeRootDomain(host string) string {
 //     rootDomain="bbc.com"): also rewrite "https://rootDomain" and
 //     "http://rootDomain" so that canonical URLs like https://bbc.com/ don't leak.
 //
+//  6. When alsoProxyRe is non-nil: additional external domains are routed via
+//     /__sd__/<host>/ the same way as target subdomains. This handles CDN
+//     domains that share content with the target but live on a different TLD
+//     (e.g. bbci.co.uk for www.bbc.com). Provided via -also-proxy flag.
+//
 // This MUST run before user-supplied replacements.  If the user has -replace
 // ctf:acme, then "ctf.io" would become "acme.io" before we can substitute it
 // with "localhost:8080", leaving the upstream hostname partially visible.
@@ -625,7 +630,7 @@ func computeRootDomain(host string) string {
 // bareTargetRe matches targetHost only when NOT preceded or followed by a
 // domain-continuation character (letter, digit, hyphen, dot), preventing
 // substring corruption in unrelated hostnames.
-func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe, bareTargetRe *regexp.Regexp) string {
+func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe, bareTargetRe, alsoProxyRe *regexp.Regexp) string {
 	if proxyAddr == "" {
 		return s
 	}
@@ -705,6 +710,23 @@ func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe
 		// Do NOT do a bare rootDomain scan here — "bbc.com" appears legitimately
 		// in third-party tracker query params (utm_source=bbc.com) and replacing
 		// it blindly would corrupt those partner URLs.
+	}
+
+	// Step 6: route -also-proxy extra domains through /__sd__/<host>/ so that
+	// CDN scripts from related-but-different-TLD domains are fetched via the
+	// proxy and receive string replacement treatment.
+	if alsoProxyRe != nil {
+		s = alsoProxyRe.ReplaceAllStringFunc(s, func(match string) string {
+			sub := alsoProxyRe.FindStringSubmatch(match)
+			if len(sub) < 3 {
+				return match
+			}
+			hostStr := sub[1]
+			if idx := strings.Index(hostStr, "//"); idx >= 0 {
+				hostStr = hostStr[idx+2:]
+			}
+			return proxyBase + subdomainPrefix + hostStr + sub[2]
+		})
 	}
 
 	// Restore /__sd__/<host> segments after the bare scans are done.
@@ -1198,9 +1220,10 @@ func removeVaryAcceptEncoding(h http.Header) {
 const maxFollowRedirects = 10
 
 type followTargetRedirectsTransport struct {
-	rt         http.RoundTripper
-	rootDomain string // e.g. "github.com"
-	scheme     string // "https" or "http"
+	rt                http.RoundTripper
+	rootDomain        string          // e.g. "github.com"
+	scheme            string          // "https" or "http"
+	alsoProxyDomains  map[string]bool // lowercase extra-proxy domains
 }
 
 func (t *followTargetRedirectsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -1221,10 +1244,19 @@ func (t *followTargetRedirectsTransport) RoundTrip(req *http.Request) (*http.Res
 		if err != nil || locURL.Host == "" {
 			return resp, nil
 		}
-		// Only follow if the redirect target is within the same root domain.
+		// Only follow if the redirect target is within the same root domain or an
+		// explicitly allowed extra-proxy domain.
 		h := strings.ToLower(locURL.Host)
 		root := strings.ToLower(t.rootDomain)
-		if h != root && !strings.HasSuffix(h, "."+root) {
+		withinRoot := h == root || strings.HasSuffix(h, "."+root)
+		withinAlso := false
+		for extra := range t.alsoProxyDomains {
+			if h == extra || strings.HasSuffix(h, "."+extra) {
+				withinAlso = true
+				break
+			}
+		}
+		if !withinRoot && !withinAlso {
 			return resp, nil // cross-domain redirect — let the browser handle it
 		}
 		resp.Body.Close()
@@ -1475,7 +1507,11 @@ func (c *wsLoggingConn) Close() error { return c.rwc.Close() }
 //
 // logger handles all per-request and startup logging; pass a Logger constructed
 // with NewLogger.
-func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger, extraHeaders []headerPair, ignoredHosts map[string]bool, maxBodyBytes int64) *httputil.ReverseProxy {
+// alsoProxy is an optional list of additional external domains (not subdomains
+// of the target) whose URLs should be routed through the proxy via /__sd__/.
+// Useful for CDN domains on different TLDs that share content with the target
+// (e.g. bbci.co.uk for www.bbc.com). Pass nil to disable.
+func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger, extraHeaders []headerPair, ignoredHosts map[string]bool, maxBodyBytes int64, alsoProxy []string) *httputil.ReverseProxy {
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = maxBodyRewriteDefault
 	}
@@ -1530,6 +1566,29 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		)
 	}
 
+	// Build alsoProxyRe — matches URLs from -also-proxy domains so they can be
+	// routed through /__sd__/<host>/ the same way as target subdomains.
+	// alsoProxyDomains is a normalised lowercase set used in the SSRF validator.
+	var alsoProxyRe *regexp.Regexp
+	alsoProxyDomains := map[string]bool{} // lower-case set for quick lookup
+	if len(alsoProxy) > 0 && proxyAddr != "" {
+		var parts []string
+		for _, d := range alsoProxy {
+			d = strings.ToLower(strings.TrimSpace(d))
+			if d == "" {
+				continue
+			}
+			alsoProxyDomains[d] = true
+			// Match the domain itself and all its subdomains.
+			parts = append(parts, `(?:[a-zA-Z0-9][-a-zA-Z0-9]*\.)*`+regexp.QuoteMeta(d))
+		}
+		if len(parts) > 0 {
+			alsoProxyRe = regexp.MustCompile(
+				`(?i)((?:https?:)?//(?:` + strings.Join(parts, "|") + `))([/?#"'\s\x00]|$)`,
+			)
+		}
+	}
+
 	// Clone DefaultTransport to preserve connection-pooling and timeout settings,
 	// then override TLS config when certificate verification must be skipped and
 	// apply explicit per-phase timeouts to prevent hung upstreams from leaking
@@ -1561,7 +1620,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	// Follow upstream redirects that stay within the same root domain (e.g.
 	// www.github.com → github.com).  This prevents infinite redirect loops
 	// where the proxy rewrites the Location back to itself indefinitely.
-	rt = &followTargetRedirectsTransport{rt: rt, rootDomain: rootDomain, scheme: scheme}
+	rt = &followTargetRedirectsTransport{rt: rt, rootDomain: rootDomain, scheme: scheme, alsoProxyDomains: alsoProxyDomains}
 	// Always wrap with the SSRF guard so that /__sd__/ requests flagged by the
 	// director are short-circuited with a 403 before any upstream connection.
 	rt = &ssrfGuardTransport{rt: rt}
@@ -1657,6 +1716,15 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			}
 			validSubdomain := !hostnameInvalid(subHostLower) &&
 				(subHostLower == rootLower || strings.HasSuffix(subHostLower, "."+rootLower))
+			// Also allow hosts from the -also-proxy whitelist.
+			if !validSubdomain && len(alsoProxyDomains) > 0 && !hostnameInvalid(subHostLower) {
+				for extra := range alsoProxyDomains {
+					if subHostLower == extra || strings.HasSuffix(subHostLower, "."+extra) {
+						validSubdomain = true
+						break
+					}
+				}
+			}
 			if !validSubdomain {
 				// Flag request as SSRF-blocked in the context.
 				// ssrfGuardTransport intercepts this and returns a 403 directly,
@@ -1927,7 +1995,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 				continue
 			}
 			for i, v := range vals {
-				v = maskResponseString(v, targetHost, rootDomain, effectiveProxyAddr, subdomainRe, bareTargetRe)
+				v = maskResponseString(v, targetHost, rootDomain, effectiveProxyAddr, subdomainRe, bareTargetRe, alsoProxyRe)
 			if headerSubHost != "" {
 				switch key {
 				case "Location", "Content-Location":
@@ -2129,7 +2197,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		//
 		// We also count how many user-substitutions happened so the log line can
 		// report "[N replaced]" even in non-verbose mode.
-		rewritten := maskResponseString(string(raw), targetHost, rootDomain, effectiveProxyAddr, subdomainRe, bareTargetRe)
+		rewritten := maskResponseString(string(raw), targetHost, rootDomain, effectiveProxyAddr, subdomainRe, bareTargetRe, alsoProxyRe)
 
 		// Pass 2: if this response came from a subdomain host (not the main target),
 		// rewrite root-relative paths so browsers resolve them against the subdomain
