@@ -1763,7 +1763,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 				// ASCII allowlist that inadvertently permitted ';', '%', '?', '#',
 				// etc., which can be used to craft a host string that passes the
 				// HasSuffix(".rootDomain") check while actually routing to an
-				// unrelated host.
+				// unrelated host (e.g. "evil.com;legit.target.com").
 				//
 				// Valid set:  [a-z0-9-.] (DNS labels, already lowercased)
 				//              ':'  — port separator (e.g. host:8443)
@@ -1777,6 +1777,23 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 					case c == '-' || c == '.' || c == ':' || c == '[' || c == ']' || c == '_':
 					default:
 						return true
+					}
+				}
+				// Reject empty DNS labels (consecutive/leading/trailing dots) and
+				// labels that start or end with a hyphen — all structurally invalid
+				// and potentially confusing for suffix matching.
+				// Skip this check for IPv6 addresses (wrapped in brackets).
+				bare := h
+				if i := strings.LastIndex(h, ":"); i >= 0 {
+					if h[0] != '[' { // strip port from domain; leave IPv6 alone
+						bare = h[:i]
+					}
+				}
+				if bare[0] != '[' {
+					for _, label := range strings.Split(bare, ".") {
+						if label == "" || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+							return true
+						}
 					}
 				}
 				return false

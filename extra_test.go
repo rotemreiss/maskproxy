@@ -4711,3 +4711,41 @@ func TestSSRFSemicolonBypassBlocked(t *testing.T) {
 		t.Errorf("expected 403 for semicolon-bypass attempt, got %d", resp.StatusCode)
 	}
 }
+
+
+// TestSSRFDoubleDotBypassBlocked verifies that hostnames with empty DNS labels
+// (leading dots, consecutive dots) are rejected by the SSRF guard even though
+// dot is in the hostnameInvalid allowlist.  e.g. "..target.com" passes
+// HasSuffix("..target.com", ".target.com") but is an invalid hostname.
+func TestSSRFDoubleDotBypassBlocked(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
+
+	rep, _ := NewReplacer("", false)
+	rp := NewReverseProxy(upstreamHost, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil, 0, nil)
+	srv := httptest.NewServer(rp)
+	defer srv.Close()
+
+	// Test hostname patterns with empty labels or label-starting/ending hyphens.
+	// None of these are valid DNS hostnames and all should be rejected.
+	bypassAttempts := []string{
+		"..example.com",
+		".example.com",
+		"x..example.com",
+		"-bad.example.com",
+		"bad-.example.com",
+	}
+	for _, host := range bypassAttempts {
+		resp, err := http.Get(srv.URL + "/__sd__/" + host + "/secret")
+		if err != nil {
+			t.Fatalf("request failed for %q: %v", host, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("expected 403 for invalid-label bypass %q, got %d", host, resp.StatusCode)
+		}
+	}
+}
