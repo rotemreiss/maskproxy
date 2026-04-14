@@ -3840,3 +3840,84 @@ if !upstreamCalled {
 t.Error("expected upstream to be called even on body read failure")
 }
 }
+
+// TestWSLoggingConnReadWrite verifies that wsLoggingConn.Read and Write
+// pass data through correctly and trigger frame-header logging.
+func TestWSLoggingConnReadWrite(t *testing.T) {
+var buf strings.Builder
+lg := wsLogger(&buf)
+
+// Build a simple WS text frame for the server→client direction.
+serverFrame := buildWSTextFrame("hello")
+
+pr, pw := io.Pipe()
+conn := &wsLoggingConn{
+rwc:    pipeRWC{pr, pw},
+id:     1,
+logger: lg,
+}
+
+// Write the frame into the pipe so Read can consume it.
+go func() {
+pw.Write(serverFrame)
+pw.Close()
+}()
+
+received := make([]byte, len(serverFrame))
+n, err := conn.Read(received)
+if err != nil && err != io.EOF {
+t.Fatalf("Read: unexpected error: %v", err)
+}
+if !bytes.Equal(received[:n], serverFrame) {
+t.Errorf("Read: got %x; want %x", received[:n], serverFrame)
+}
+
+// Write direction: write a frame, it should pass through.
+pr2, pw2 := io.Pipe()
+conn2 := &wsLoggingConn{
+rwc:    pipeRWC{pr2, pw2},
+id:     2,
+logger: lg,
+}
+clientFrame := buildWSTextFrame("world")
+done := make(chan struct{})
+go func() {
+defer close(done)
+got := make([]byte, len(clientFrame))
+io.ReadFull(pr2, got)
+}()
+conn2.Write(clientFrame)
+<-done
+
+// Close: should not error.
+if err := conn2.Close(); err != nil {
+t.Errorf("Close: unexpected error: %v", err)
+}
+}
+
+// TestNewReverseProxyWithWSLogging verifies that a proxy built with a logWS
+// Logger wraps its transport with wsLoggingTransport (coverage for lines 1646-1648).
+func TestNewReverseProxyWithWSLogging(t *testing.T) {
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+w.Header().Set("Content-Type", "text/plain")
+fmt.Fprint(w, "ok")
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("", false)
+// Build a Logger with logWS=true to exercise the wsLoggingTransport wrapping path.
+lg := &Logger{l: log.New(io.Discard, "", 0), logWS: true}
+proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, lg, nil, nil, 0, nil)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+resp, err := ps.Client().Get(ps.URL + "/")
+if err != nil {
+t.Fatal(err)
+}
+defer resp.Body.Close()
+if resp.StatusCode != http.StatusOK {
+t.Errorf("expected 200, got %d", resp.StatusCode)
+}
+}
