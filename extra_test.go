@@ -4271,3 +4271,60 @@ if !strings.Contains(buf.String(), "should appear: 42") {
 t.Errorf("expected verbose output; got %q", buf.String())
 }
 }
+
+// TestWSFrameParser64BitLen verifies parsing of a frame with 64-bit extended
+// payload length (payLen7 == 127) — covers the case 127 branch in parseAndLog.
+func TestWSFrameParser64BitLen(t *testing.T) {
+	var buf strings.Builder
+	lg := wsLogger(&buf)
+	var s wsFrameParseState
+
+	// Build a 64-bit extended-length text frame with 70000 zero payload bytes.
+	payLen := 70000
+	frame := make([]byte, 2+8+payLen)
+	frame[0] = 0x81 // FIN + text
+	frame[1] = 127  // 64-bit extended length follows
+	frame[2] = 0; frame[3] = 0; frame[4] = 0; frame[5] = 0
+	frame[6] = byte(payLen >> 24)
+	frame[7] = byte(payLen >> 16)
+	frame[8] = byte(payLen >> 8)
+	frame[9] = byte(payLen & 0xFF)
+
+	s.feed(frame, 1, "WS↓", lg)
+	if !strings.Contains(buf.String(), "len=70000") {
+		t.Errorf("expected len=70000, got: %q", buf.String())
+	}
+}
+
+// TestWSFrameParserPayloadSkip verifies that payload bytes spanning multiple
+// feed() calls are skipped correctly (exercises the payloadRem > 0 branch).
+func TestWSFrameParserPayloadSkip(t *testing.T) {
+var buf strings.Builder
+lg := wsLogger(&buf)
+var s wsFrameParseState
+
+// First frame: text "hello" (5 payload bytes).
+// Second frame: ping (0 bytes).
+// Feed them in three chunks to force the payload-skip path across calls.
+frame1 := buildWSTextFrame("hello") // 2 header + 5 payload = 7 bytes
+frame2 := buildWSPingFrame()        // 2 bytes
+
+// Chunk 1: full frame1 header + 3 of 5 payload bytes.
+chunk1 := frame1[:5]
+// Chunk 2: remaining 2 payload bytes of frame1.
+chunk2 := frame1[5:]
+// Chunk 3: frame2.
+chunk3 := frame2
+
+s.feed(chunk1, 1, "WS↓", lg)
+s.feed(chunk2, 1, "WS↓", lg)
+s.feed(chunk3, 1, "WS↓", lg)
+
+got := buf.String()
+if !strings.Contains(got, "text") {
+t.Errorf("expected text frame in log, got: %q", got)
+}
+if !strings.Contains(got, "ping") {
+t.Errorf("expected ping frame in log after payload skip, got: %q", got)
+}
+}
