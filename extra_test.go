@@ -3921,3 +3921,86 @@ if resp.StatusCode != http.StatusOK {
 t.Errorf("expected 200, got %d", resp.StatusCode)
 }
 }
+
+// TestVerboseLogRequestResponse verifies the verbose=true code paths in
+// LogRequest and LogResponse, covering the header+body dump branches.
+func TestVerboseLogRequestResponse(t *testing.T) {
+var buf strings.Builder
+lg := &Logger{l: log.New(&buf, "", 0), verbose: true}
+
+// Craft a request with a sensitive header (should be redacted) and a normal one.
+req, _ := http.NewRequest("GET", "http://example.com/path", nil)
+req.Header.Set("Authorization", "Bearer secret")
+req.Header.Set("X-Custom", "value")
+
+start := lg.LogRequest(req, "request-body", false, 3)
+if start.IsZero() {
+t.Error("expected non-zero start time")
+}
+out := buf.String()
+if !strings.Contains(out, "[redacted]") {
+t.Errorf("expected Authorization header to be redacted; got: %q", out)
+}
+if !strings.Contains(out, "X-Custom: value") {
+t.Errorf("expected X-Custom header; got: %q", out)
+}
+if !strings.Contains(out, "request-body") {
+t.Errorf("expected body snapshot; got: %q", out)
+}
+if !strings.Contains(out, "[3 replaced]") {
+t.Errorf("expected replacement count; got: %q", out)
+}
+
+// LogResponse verbose path: build a minimal *http.Response.
+buf.Reset()
+respReq, _ := http.NewRequest("GET", "http://example.com/path", nil)
+resp := &http.Response{
+StatusCode:    200,
+ContentLength: -1,
+Header:        http.Header{"Set-Cookie": []string{"sess=abc"}},
+Request:       respReq,
+}
+lg.LogResponse(resp, "response-body", start, 2)
+out = buf.String()
+if !strings.Contains(out, "[redacted]") {
+t.Errorf("expected Set-Cookie header to be redacted; got: %q", out)
+}
+if !strings.Contains(out, "response-body") {
+t.Errorf("expected body snapshot in response; got: %q", out)
+}
+if !strings.Contains(out, "[2 replaced]") {
+t.Errorf("expected replacement count in response; got: %q", out)
+}
+}
+
+// TestBodyDumpTruncation verifies that bodyDump truncates long bodies.
+func TestBodyDumpTruncation(t *testing.T) {
+// Build a body larger than verboseBodyPreview (512 bytes).
+longBody := strings.Repeat("x", verboseBodyPreview+100)
+out := bodyDump("test", longBody)
+if !strings.Contains(out, "truncated") {
+t.Errorf("expected truncation notice; got: %q", out[:100])
+}
+if !strings.Contains(out, "100 bytes truncated") {
+t.Errorf("expected 100 bytes truncated; got: %q", out[:200])
+}
+}
+
+// TestBodyDumpEmpty verifies that bodyDump handles empty body.
+func TestBodyDumpEmpty(t *testing.T) {
+out := bodyDump("test", "")
+if !strings.Contains(out, "empty") {
+t.Errorf("expected empty body note; got: %q", out)
+}
+}
+
+// TestVerboseLogRequestWSMethod verifies that WS requests show "WS↑" as method.
+func TestVerboseLogRequestWSMethod(t *testing.T) {
+var buf strings.Builder
+lg := &Logger{l: log.New(&buf, "", 0), verbose: false}
+req, _ := http.NewRequest("GET", "http://example.com/ws", nil)
+lg.LogRequest(req, "", true, 0)
+if !strings.Contains(buf.String(), "WS↑") {
+t.Errorf("expected WS method; got: %q", buf.String())
+}
+}
