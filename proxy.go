@@ -1183,6 +1183,78 @@ func removeVaryAcceptEncoding(h http.Header) {
 	}
 }
 
+// ── Follow-target-redirects transport ────────────────────────────────────────
+
+// followTargetRedirectsTransport follows upstream 3xx redirects that stay
+// within the same root domain (e.g. www.github.com → github.com).  Without
+// this, the proxy would forward the redirect to the browser as
+// "Location: http://localhost:PORT/" which the browser follows forever in a
+// loop (the proxy always fetches www.github.com, which always 302s to
+// github.com, which the proxy rewrites back to localhost:PORT…).
+//
+// Only redirects whose target host is identical to, or a subdomain of,
+// rootDomain are followed.  Cross-domain redirects (e.g. to an OAuth provider)
+// are passed through so the browser can handle them properly.
+const maxFollowRedirects = 10
+
+type followTargetRedirectsTransport struct {
+	rt         http.RoundTripper
+	rootDomain string // e.g. "github.com"
+	scheme     string // "https" or "http"
+}
+
+func (t *followTargetRedirectsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r := req
+	for i := 0; i < maxFollowRedirects; i++ {
+		resp, err := t.rt.RoundTrip(r)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+			return resp, nil
+		}
+		loc := resp.Header.Get("Location")
+		if loc == "" {
+			return resp, nil
+		}
+		locURL, err := url.Parse(loc)
+		if err != nil || locURL.Host == "" {
+			return resp, nil
+		}
+		// Only follow if the redirect target is within the same root domain.
+		h := strings.ToLower(locURL.Host)
+		root := strings.ToLower(t.rootDomain)
+		if h != root && !strings.HasSuffix(h, "."+root) {
+			return resp, nil // cross-domain redirect — let the browser handle it
+		}
+		resp.Body.Close()
+		// Build a new request for the redirect target, preserving method for
+		// 307/308 and switching to GET for 301/302/303 (matching browser behaviour).
+		method := r.Method
+		var body io.ReadCloser
+		if resp.StatusCode == 303 || ((resp.StatusCode == 301 || resp.StatusCode == 302) && r.Method != http.MethodGet && r.Method != http.MethodHead) {
+			method = http.MethodGet
+			body = http.NoBody
+		} else if r.Body != nil && r.Body != http.NoBody {
+			// Body already consumed by the previous RoundTrip — cannot replay.
+			// For non-idempotent same-domain redirects without a body reader, skip.
+			body = http.NoBody
+		}
+		newReq := r.Clone(r.Context())
+		newReq.URL = locURL
+		if locURL.Scheme == "" {
+			newReq.URL.Scheme = t.scheme
+		}
+		newReq.Host = locURL.Host
+		newReq.Method = method
+		newReq.Body = body
+		newReq.ContentLength = 0
+		r = newReq
+	}
+	// Exceeded redirect limit — fall back to final RoundTrip without following.
+	return t.rt.RoundTrip(r)
+}
+
 // ── SSRF guard transport ──────────────────────────────────────────────────────
 
 // ssrfGuardTransport wraps an http.RoundTripper and short-circuits requests
@@ -1486,6 +1558,10 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	if logger.logWS {
 		rt = &wsLoggingTransport{rt: transport, logger: logger}
 	}
+	// Follow upstream redirects that stay within the same root domain (e.g.
+	// www.github.com → github.com).  This prevents infinite redirect loops
+	// where the proxy rewrites the Location back to itself indefinitely.
+	rt = &followTargetRedirectsTransport{rt: rt, rootDomain: rootDomain, scheme: scheme}
 	// Always wrap with the SSRF guard so that /__sd__/ requests flagged by the
 	// director are short-circuited with a 403 before any upstream connection.
 	rt = &ssrfGuardTransport{rt: rt}
