@@ -4210,3 +4210,64 @@ if !strings.Contains(err.Error(), "invalid pair") {
 t.Errorf("error %q doesn't mention 'invalid pair'", err.Error())
 }
 }
+
+// ─── flag types ───────────────────────────────────────────────────────────────
+
+// TestHeaderFlagStringAndSet verifies the headerFlag custom flag type.
+func TestHeaderFlagStringAndSet(t *testing.T) {
+var f headerFlag
+if f.String() != "" {
+t.Errorf("empty String() should be empty, got %q", f.String())
+}
+if err := f.Set("X-Foo: bar"); err != nil {
+t.Fatalf("Set: %v", err)
+}
+if err := f.Set("X-Baz: qux"); err != nil {
+t.Fatalf("Set: %v", err)
+}
+if !strings.Contains(f.String(), "X-Foo: bar") {
+t.Errorf("String() missing first entry: %q", f.String())
+}
+// Empty value should be rejected.
+if err := f.Set("   "); err == nil {
+t.Error("expected error for blank Set, got nil")
+}
+}
+
+// TestIgnoreHostFlagStringAndSet verifies the ignoreHostFlag custom flag type.
+func TestIgnoreHostFlagStringAndSet(t *testing.T) {
+var f ignoreHostFlag
+if f.String() != "" {
+t.Errorf("empty String() should be empty, got %q", f.String())
+}
+if err := f.Set("example.com"); err != nil {
+t.Fatalf("Set: %v", err)
+}
+if !strings.Contains(f.String(), "example.com") {
+t.Errorf("String() missing entry: %q", f.String())
+}
+// Empty value should be rejected.
+if err := f.Set(""); err == nil {
+t.Error("expected error for empty Set, got nil")
+}
+}
+
+// ─── logger Verbosef ──────────────────────────────────────────────────────────
+
+// TestVerbosefOnlyLogsWhenVerbose verifies that Verbosef is a no-op when
+// verbose=false and logs when verbose=true.
+func TestVerbosefOnlyLogsWhenVerbose(t *testing.T) {
+var buf strings.Builder
+lg := &Logger{l: log.New(&buf, "", 0), verbose: false}
+lg.Verbosef("should not appear")
+if buf.Len() > 0 {
+t.Errorf("expected no output when verbose=false; got %q", buf.String())
+}
+
+buf.Reset()
+lg.verbose = true
+lg.Verbosef("should appear: %d", 42)
+if !strings.Contains(buf.String(), "should appear: 42") {
+t.Errorf("expected verbose output; got %q", buf.String())
+}
+}
