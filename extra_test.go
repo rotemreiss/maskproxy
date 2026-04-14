@@ -3632,3 +3632,105 @@ func TestFollowTargetRedirects303PostToGet(t *testing.T) {
 		t.Errorf("303 must always use GET for redirect, got %q", capturedMethod)
 	}
 }
+
+// TestDeflateDecodeFailurePassthrough verifies that when upstream sends
+// Content-Encoding: deflate with bytes that begin with the zlib magic (0x78)
+// but have an invalid checksum byte, the proxy falls back to returning the raw
+// (undecoded) body instead of crashing.
+func TestDeflateDecodeFailurePassthrough(t *testing.T) {
+	// 0x78 triggers the zlib.NewReader path. Second byte 0x00 makes
+	// (0x78*256 + 0x00) % 31 = 30 ≠ 0, so zlib.NewReader returns an error.
+	badDeflate := []byte{0x78, 0x00, 0xff, 0xfe, 0xde, 0xad}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Encoding", "deflate")
+		w.Write(badDeflate)
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("ctf:acme", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil, 0, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	// Must respond (not crash or hang).
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 passthrough on deflate error, got %d", resp.StatusCode)
+	}
+	// Body must be the raw (undecoded) bytes forwarded as-is.
+	if !bytes.Equal(body, badDeflate) {
+		t.Errorf("deflate failure: got %x; want raw %x", body, badDeflate)
+	}
+}
+
+// TestAlsoProxyEmptyStringSkipped verifies that passing an empty string in the
+// alsoProxy list does not panic and is silently skipped (the domain is not
+// registered in alsoProxyDomains).
+func TestAlsoProxyEmptyStringSkipped(t *testing.T) {
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+w.Header().Set("Content-Type", "text/plain")
+fmt.Fprint(w, "ok")
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("", false)
+// Pass empty string and whitespace — both must be silently skipped.
+proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, []string{"", "  ", "valid.com"})
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+resp, err := ps.Client().Get(ps.URL + "/")
+if err != nil {
+t.Fatal(err)
+}
+defer resp.Body.Close()
+if resp.StatusCode != http.StatusOK {
+t.Errorf("expected 200, got %d", resp.StatusCode)
+}
+}
+
+// TestRawPathReplacement verifies that when a request has a non-empty RawPath
+// (percent-encoded URL), the director applies alias→original replacement to
+// both Path and RawPath.
+func TestRawPathReplacement(t *testing.T) {
+var capturedPath, capturedRawPath string
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+capturedPath = r.URL.Path
+capturedRawPath = r.URL.RawPath
+w.WriteHeader(http.StatusOK)
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("foo:bar", false)
+proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+// Request with RawPath that contains the alias "bar" (→ should become "foo").
+// Use a manually-crafted request so RawPath is set explicitly.
+req, _ := http.NewRequest("GET", ps.URL+"/path/bar%2Fmore", nil)
+resp, err := http.DefaultClient.Do(req)
+if err != nil {
+t.Fatal(err)
+}
+resp.Body.Close()
+
+// "bar" is the alias for "foo" — ToOriginal("bar") = "foo".
+if !strings.Contains(capturedPath, "foo") {
+t.Errorf("Path not de-aliased: %q", capturedPath)
+}
+if capturedRawPath != "" && !strings.Contains(capturedRawPath, "foo") {
+t.Errorf("RawPath not de-aliased: %q", capturedRawPath)
+}
+}
