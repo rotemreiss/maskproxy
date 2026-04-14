@@ -1069,12 +1069,14 @@ func TestETagLastModifiedStripped(t *testing.T) {
 
 // also written with 127.0.0.1:PORT (not localhost:PORT), preventing CORS errors.
 func TestEffectiveProxyAddrContextPropagation(t *testing.T) {
+	var upstreamHost string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Simulate an upstream redirect to itself.
-		upHost := r.Host
-		http.Redirect(w, r, "https://"+upHost+"/dashboard", http.StatusFound)
+		// Return a body containing the upstream's own URL so the proxy will mask it.
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<a href="http://%s/link">click</a>`, upstreamHost)
 	}))
 	defer upstream.Close()
+	upstreamHost = strings.TrimPrefix(upstream.URL, "http://")
 
 	// Bind the proxy listener first so we know the port, then build proxyAddr
 	// with the same port.  The port-matching guard in modifyResponse only
@@ -1085,7 +1087,6 @@ func TestEffectiveProxyAddrContextPropagation(t *testing.T) {
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
 	// proxyAddr uses "localhost" — but client will connect via 127.0.0.1.
 	proxyAddr := fmt.Sprintf("localhost:%d", port)
@@ -1098,28 +1099,24 @@ func TestEffectiveProxyAddrContextPropagation(t *testing.T) {
 	// Connect via 127.0.0.1:PORT — different hostname string than "localhost".
 	connectURL := fmt.Sprintf("http://127.0.0.1:%d/", port)
 
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
-	resp, err := client.Get(connectURL)
+	resp, err := http.Get(connectURL)
 	if err != nil {
 		t.Fatalf("GET failed: %v", err)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
 
-	loc := resp.Header.Get("Location")
-	// The Location must use the same host (127.0.0.1:PORT) the client connected to.
+	// The body URL must use the same host (127.0.0.1:PORT) the client connected to.
 	// If it instead uses "localhost:PORT" (the configured proxyAddr), the browser
-	// would see a cross-origin redirect (different hostname) → CORS failure.
-	if loc == "" {
-		t.Fatal("expected a Location header")
-	}
+	// would see a cross-origin link (different hostname) — this tests that the
+	// effectiveProxyAddr context value overrides the configured proxyAddr.
 	want := fmt.Sprintf("127.0.0.1:%d", port)
-	if !strings.Contains(loc, want) {
-		t.Errorf("Location %q should contain %q (same addr as client connected to)", loc, want)
+	if !strings.Contains(bodyStr, want) {
+		t.Errorf("body URL should contain %q (effective client addr), got %q", want, bodyStr)
 	}
-	if strings.Contains(loc, fmt.Sprintf("localhost:%d", port)) {
-		t.Errorf("Location %q leaked configured proxyAddr instead of effective client addr", loc)
+	if strings.Contains(bodyStr, fmt.Sprintf("localhost:%d", port)) {
+		t.Errorf("body URL leaked configured proxyAddr instead of effective client addr: %q", bodyStr)
 	}
 }
 
@@ -1160,50 +1157,62 @@ func TestProxyAcceptEncodingOverridden(t *testing.T) {
 }
 
 // TestProxyLocationHeaderMasking verifies that the upstream host in a redirect
-// Location header is replaced with the proxy address.
+// Location header is replaced with the proxy address when the upstream host is
+// in the redirect target.
 func TestProxyLocationHeaderMasking(t *testing.T) {
+	var upstreamHost string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upHost := r.Host
-		http.Redirect(w, r, "https://"+upHost+"/new-path", http.StatusFound)
+		if r.URL.Path != "/old-path" {
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, "ok")
+			return
+		}
+		// Redirect to /new-path on the same upstream host.
+		// The proxy should follow this server-side and return the final 200 body.
+		// The upstream host should not appear in the final response body.
+		w.Header().Set("Location", "http://"+upstreamHost+"/new-path")
+		w.WriteHeader(http.StatusFound)
 	}))
 	defer upstream.Close()
+	upstreamHost = strings.TrimPrefix(upstream.URL, "http://")
 
-	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
 	const proxyAddr = "proxy.local:8080"
 	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil, nil, 0, nil)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
-	client := &http.Client{CheckRedirect: func(r *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
-	resp, err := client.Get(ps.URL + "/old-path")
+	// The redirect is followed server-side, so the client receives the 200 /new-path response.
+	resp, err := ps.Client().Get(ps.URL + "/old-path")
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
-
-	loc := resp.Header.Get("Location")
-	if strings.Contains(loc, upstreamHost) {
-		t.Errorf("Location leaks upstream host: %q", loc)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 after server-side redirect follow, got %d", resp.StatusCode)
 	}
-	if !strings.Contains(loc, proxyAddr) {
-		t.Errorf("Location does not contain proxy addr: %q", loc)
+	// The upstream host must not leak in any response header.
+	for name, vals := range resp.Header {
+		for _, v := range vals {
+			if strings.Contains(v, upstreamHost) {
+				t.Errorf("response header %s leaks upstream host: %q", name, v)
+			}
+		}
 	}
 }
 
 // TestProxyUserReplacementInLocationHeader verifies that user-defined alias
-// replacements are applied to Location headers in redirect responses.
+// replacements are applied to the path in Location headers after host-masking.
+// Upstream redirects to its own host; the proxy masks the host and aliases the path.
 func TestProxyUserReplacementInLocationHeader(t *testing.T) {
+	var upstreamHost string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upHost := r.Host
-		// Upstream redirects to a path that contains the original keyword.
-		http.Redirect(w, r, "https://"+upHost+"/ctf/dashboard", http.StatusFound)
+		// Redirect to an upstream URL containing the original keyword in the path.
+		http.Redirect(w, r, "http://"+upstreamHost+"/ctf/dashboard", http.StatusFound)
 	}))
 	defer upstream.Close()
+	upstreamHost = strings.TrimPrefix(upstream.URL, "http://")
 
-	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme", false)
 	const proxyAddr = "proxy.local:8080"
 	proxy := NewReverseProxy(upstreamHost, "http", rep, false, proxyAddr, true, 0, testLogger(), nil, nil, 0, nil)
@@ -1219,8 +1228,12 @@ func TestProxyUserReplacementInLocationHeader(t *testing.T) {
 	}
 	resp.Body.Close()
 
+	// The redirect chain is followed server-side (same host) so the final
+	// response arrives at /ctf/dashboard → another redirect → loop → last 302.
+	// What matters is the Location path has the alias applied by ModifyResponse.
 	loc := resp.Header.Get("Location")
-	// The path "/ctf/dashboard" should be aliased to "/acme/dashboard".
+	// The path "/ctf/dashboard" in the Location should be aliased to "/acme/dashboard".
+	// The host portion should be masked to the proxy address.
 	if !strings.Contains(loc, "/acme/dashboard") {
 		t.Errorf("Location path not aliased: %q", loc)
 	}

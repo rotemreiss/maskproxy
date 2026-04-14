@@ -1285,3 +1285,92 @@ func TestSdPathNotUnreplaced(t *testing.T) {
 		t.Errorf("path corrupted: got %q want %q", capturedPath, "/static/newsRoomScript.js")
 	}
 }
+
+// TestFollowTargetRedirects verifies that the followTargetRedirectsTransport
+// correctly follows same-root-domain redirects server-side and stops at
+// cross-domain or relative-only Location headers.
+func TestFollowTargetRedirects(t *testing.T) {
+	// Build a chain: / → /step1 → /final (302 with absolute same-host URLs).
+	// The followTargetRedirectsTransport follows same-root-domain absolute redirects
+	// server-side.  Relative-path redirects are returned as-is to the browser.
+	var hitFinal int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			// Absolute URL redirect within same host.
+			w.Header().Set("Location", "http://"+r.Host+"/step1")
+			w.WriteHeader(http.StatusFound)
+		case "/step1":
+			w.Header().Set("Location", "http://"+r.Host+"/final")
+			w.WriteHeader(http.StatusFound)
+		case "/final":
+			hitFinal++
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, "done")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	// Use client that doesn't follow redirects — the proxy should handle them server-side.
+	noRedirectClient := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := noRedirectClient.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	// The proxy should have followed both internal redirects and returned 200 /final.
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+	if string(body) != "done" {
+		t.Errorf("expected final body 'done', got %q", body)
+	}
+	if hitFinal != 1 {
+		t.Errorf("expected /final to be hit once, got %d", hitFinal)
+	}
+}
+
+// TestFollowTargetRedirectsCrossDomain verifies that redirects to a completely
+// different domain are NOT followed server-side (the browser should handle them).
+func TestFollowTargetRedirectsCrossDomain(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Redirect to an unrelated domain.
+		w.Header().Set("Location", "https://evil.example.net/page")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	// Must not follow redirects at the client level so we can inspect the proxy's response.
+	noRedirectClient := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := noRedirectClient.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	// Cross-domain 302 must be passed through to the browser unchanged.
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("expected 302 pass-through, got %d", resp.StatusCode)
+	}
+	if !strings.Contains(resp.Header.Get("Location"), "evil.example.net") {
+		t.Errorf("expected original Location header, got %q", resp.Header.Get("Location"))
+	}
+}

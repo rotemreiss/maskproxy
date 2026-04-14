@@ -1270,12 +1270,17 @@ func (t *followTargetRedirectsTransport) RoundTrip(req *http.Request) (*http.Res
 		}
 		// Only follow if the redirect target is within the same root domain or an
 		// explicitly allowed extra-proxy domain.
-		h := strings.ToLower(locURL.Host)
+		h := strings.ToLower(locURL.Hostname()) // Hostname() strips port, unlike Host
 		root := strings.ToLower(t.rootDomain)
 		withinRoot := h == root || strings.HasSuffix(h, "."+root)
 		withinAlso := false
 		for extra := range t.alsoProxyDomains {
-			if h == extra || strings.HasSuffix(h, "."+extra) {
+			// extra may also include port (for test servers); strip it.
+			extraHost := extra
+			if i := strings.LastIndex(extraHost, ":"); i >= 0 && strings.IndexByte(extraHost[i:], '.') == -1 {
+				extraHost = extraHost[:i]
+			}
+			if h == extraHost || strings.HasSuffix(h, "."+extraHost) {
 				withinAlso = true
 				break
 			}
