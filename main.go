@@ -179,6 +179,7 @@ func main() {
 	var ignoreHosts ignoreHostFlag
 	flag.Var(&ignoreHosts, "ignore-host", `Exclude hosts from all proxy rewriting (comma-separated, repeatable). Wildcard "*.domain.com" matches any subdomain. Example: -ignore-host "*.bbci.co.uk,login.microsoftonline.com"`)
 	alsoProxyFlag := flag.String("also-proxy", "", "Comma-separated list of extra domains to route via /__sd__/ (e.g. bbci.co.uk,bbc.co.uk). Use for CDN domains on different TLDs that share content with -target.")
+	stripCSP := flag.Bool("strip-csp", false, "Completely remove Content-Security-Policy headers from responses")
 
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -306,7 +307,7 @@ func main() {
 		trafficStore.IgnoredHosts = sorted
 	}
 
-	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger, extraHeaders, ignoredHostsMap, maxBodyBytes, alsoProxyDomains, trafficStore)
+	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger, extraHeaders, ignoredHostsMap, maxBodyBytes, alsoProxyDomains, trafficStore, *stripCSP)
 
 	// addr is the network address the main proxy server binds to.
 	addr := fmt.Sprintf("%s:%d", *listen, *port)

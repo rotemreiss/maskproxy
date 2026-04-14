@@ -165,7 +165,7 @@ func newProxy(t *testing.T, upstream *httptest.Server, replaceSpec string) *http
 	if err != nil {
 		t.Fatalf("NewReplacer: %v", err)
 	}
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	return httptest.NewServer(proxy)
 }
 
@@ -200,7 +200,7 @@ func TestProxyRequestURLReplacement(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme,ctfd:foo", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -245,7 +245,7 @@ func TestProxyBinaryNotRewritten(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -300,7 +300,7 @@ func TestProxyLargeBodySkipsRewrite(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme", false) // no matches in body, but rewrite path is triggered
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -363,7 +363,7 @@ func TestProxyHostMasking(t *testing.T) {
 	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false) // no user replacements; masking alone is under test
 	const fakeProxyAddr = "masked.proxy:9999"
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, fakeProxyAddr, true, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, fakeProxyAddr, true, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -417,7 +417,7 @@ func TestProxyHostMaskingWithUserReplacements(t *testing.T) {
 	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("ctf:acme,ctfd:foo", false)
 	const fakeProxyAddr = "masked.proxy:9999"
-	proxy := NewReverseProxy(upstreamHost, "http", rep, false, fakeProxyAddr, true, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(upstreamHost, "http", rep, false, fakeProxyAddr, true, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -462,7 +462,7 @@ func TestProxySetCookieRewrite(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -738,7 +738,7 @@ func TestHEADRequestNoGzipError(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -939,7 +939,7 @@ func TestSubdomainRootRelativeIntegration(t *testing.T) {
 	rt := &fixedHostTransport{upstream: upstream}
 
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(rootHost, "http", rep, false, "localhost:9999", false, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(rootHost, "http", rep, false, "localhost:9999", false, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	// Override the transport so subdomain requests hit the test upstream.
 	proxy.Transport = rt
 	_ = upstreamHost // used via rt
@@ -1017,7 +1017,7 @@ func TestExtraHeadersSentUpstream(t *testing.T) {
 		{name: "X-Author", value: "Rotem"},
 		{name: "X-Token", value: "secret123"},
 	}
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), extra, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), extra, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -1054,7 +1054,7 @@ func TestExtraHeadersOverrideClient(t *testing.T) {
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
 	extra := []headerPair{{name: "X-Author", value: "ProxyValue"}}
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), extra, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), extra, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -1092,7 +1092,7 @@ func TestExtraHeadersMultiple(t *testing.T) {
 		{name: "X-B", value: "beta"},
 		{name: "X-C", value: "gamma"},
 	}
-	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), extra, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", true, 0, testLogger(), extra, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -1202,7 +1202,7 @@ func TestSdPathNotUnreplaced(t *testing.T) {
 	upHost := strings.TrimPrefix(upstreamSrv.URL, "http://")
 	rep, _ := NewReplacer("ynet:news", false)
 	proxy := NewReverseProxy("ynet.co.il", "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0,
-		[]string{upHost}, nil)
+		[]string{upHost}, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -1248,7 +1248,7 @@ func TestFollowTargetRedirects(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -1286,7 +1286,7 @@ func TestFollowTargetRedirectsCrossDomain(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -1331,7 +1331,7 @@ func TestFollowTargetRedirects307(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -1380,7 +1380,7 @@ func TestFollowTargetRedirects301PostDowngrade(t *testing.T) {
 
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -1425,7 +1425,7 @@ func TestFollowAlsoProxyDomainRedirect(t *testing.T) {
 
 	targetHost := strings.TrimPrefix(upstream.URL, "http://")
 	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(targetHost, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, []string{alsoHost}, nil)
+	proxy := NewReverseProxy(targetHost, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, []string{alsoHost}, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 
@@ -1463,7 +1463,7 @@ func TestSDPathNoTrailingSlash(t *testing.T) {
 
 	// Replace "up" → "alias" so we can verify ToOriginal runs on the host segment.
 	rep, _ := NewReplacer("up:alias", false)
-	proxy := NewReverseProxy("localhost", "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, []string{upHost}, nil)
+	proxy := NewReverseProxy("localhost", "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, []string{upHost}, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 

@@ -28,7 +28,7 @@ func TestUpstreamTimeout(t *testing.T) {
 	host := strings.TrimPrefix(hung.URL, "http://")
 	rep, _ := NewReplacer("", false)
 	// 100ms timeout — short enough for a fast test.
-	proxy := NewReverseProxy(host, "http", rep, false, "", false, 100*time.Millisecond, testLogger(), nil, nil, 0, nil, nil)
+	proxy := NewReverseProxy(host, "http", rep, false, "", false, 100*time.Millisecond, testLogger(), nil, nil, 0, nil, nil, false)
 	ps := httptest.NewServer(proxy)
 	defer ps.Close()
 

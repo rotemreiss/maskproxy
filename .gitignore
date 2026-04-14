@@ -15,3 +15,5 @@ QA.md
 .idea/
 *.swp
 cover.out
+maskproxy
+.playwright-cli

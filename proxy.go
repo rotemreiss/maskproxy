@@ -154,6 +154,11 @@ var linkHeaderRe = regexp.MustCompile(`<(/[^/][^>]*)>`)
 // are sent and stripping it might break requests unnecessarily.
 var sriIntegrityRe = regexp.MustCompile(`(?i)\s+integrity\s*=\s*(?:"[^"]*"|'[^']*')`)
 
+// metaCSPRe matches <meta http-equiv="Content-Security-Policy" content="..."> tags.
+// Browsers accept CSP delivered via these meta tags in addition to HTTP headers.
+// When -strip-csp is active, we remove these tags entirely so no CSP is enforced.
+var metaCSPRe = regexp.MustCompile(`(?i)<meta[^>]+http-equiv\s*=\s*["']Content-Security-Policy(?:-Report-Only)?["'][^>]*>`)
+
 // linkIntegrityRe strips the `; integrity=<hash>` parameter from HTTP Link
 // header values.  A Link header can carry an integrity attribute for
 // preload/preconnect hints (e.g. `Link: </app.js>; rel=preload; integrity=sha256-xxx`).
@@ -265,6 +270,37 @@ const subdomainSPAScript = `<script>(function(){` +
 	`navigator.serviceWorker.register=function(){` +
 	`return Promise.reject(new Error('SW blocked by proxy'));};` +
 	`}` +
+	`})();</script>`
+
+// wsDowngradeScript is injected into the <head> of EVERY proxied HTML page
+// (not just subdomains).  It patches the WebSocket constructor to downgrade
+// wss:// connections aimed at the proxy address to ws://, because the proxy
+// listens on plain HTTP and cannot terminate TLS.
+//
+// Many SPAs construct WebSocket URLs dynamically at runtime:
+//
+//	new WebSocket(`wss://${location.host}/api/chat`)
+//
+// maskResponseString rewrites literal "wss://target" → "ws://proxyAddr" in the
+// response body, but runtime-constructed URLs bypass that.  This script catches
+// them at the WebSocket constructor level.
+//
+// %s is replaced with the proxy host (e.g. "localhost:9012").
+const wsDowngradeScript = `<script>(function(){` +
+	`var h=%q;` +
+	`var WS=window.WebSocket;` +
+	`window.WebSocket=function(u,p){` +
+	`if(typeof u==='string'){` +
+	// Downgrade wss://proxyHost/… → ws://proxyHost/…
+	`var wss='wss://'+h;` +
+	`if(u==='wss://'+h||u.startsWith(wss+'/'))u='ws://'+h+u.slice(wss.length);` +
+	`}` +
+	`return p!==undefined?new WS(u,p):new WS(u);};` +
+	`window.WebSocket.prototype=WS.prototype;` +
+	`Object.defineProperty(window.WebSocket,'CONNECTING',{value:0});` +
+	`Object.defineProperty(window.WebSocket,'OPEN',{value:1});` +
+	`Object.defineProperty(window.WebSocket,'CLOSING',{value:2});` +
+	`Object.defineProperty(window.WebSocket,'CLOSED',{value:3});` +
 	`})();</script>`
 
 // headTagRe matches an opening <head> tag (with optional attributes) to find
@@ -684,6 +720,12 @@ func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe
 			if len(sub) < 3 {
 				return match
 			}
+			// Detect WebSocket scheme — use ws:// prefix instead of http://.
+			schemePrefix := proxyBase // default: "http://proxyAddr"
+			lowerMatch := strings.ToLower(sub[1])
+			if strings.HasPrefix(lowerMatch, "wss:") || strings.HasPrefix(lowerMatch, "ws:") {
+				schemePrefix = "ws://" + proxyAddr
+			}
 			// Extract just the hostname from sub[1] (strips leading "https:" or "").
 			hostStr := sub[1]
 			if idx := strings.Index(hostStr, "//"); idx >= 0 {
@@ -692,9 +734,9 @@ func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe
 			// If the matched host IS the target itself (e.g. www.example.com), rewrite
 			// without the subdomain prefix — the director already knows where to send it.
 			if strings.EqualFold(hostStr, targetHost) {
-				return proxyBase + sub[2]
+				return schemePrefix + sub[2]
 			}
-			return proxyBase + subdomainPrefix + hostStr + sub[2]
+			return schemePrefix + subdomainPrefix + hostStr + sub[2]
 		})
 	}
 
@@ -713,6 +755,12 @@ func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe
 	// Steps 2-4: rewrite the exact target host in scheme+host and bare forms.
 	s = strings.ReplaceAll(s, "https://"+targetHost, proxyBase)
 	s = strings.ReplaceAll(s, "http://"+targetHost, proxyBase)
+	// Rewrite WebSocket scheme URLs: wss:// → ws:// (proxy is plain HTTP).
+	// Without this, JS code containing "wss://copilot.microsoft.com/api/chat"
+	// becomes "wss://localhost:9012/api/chat" via the bare host scan, but the
+	// browser cannot establish a TLS-based WebSocket to a plain-HTTP server.
+	s = strings.ReplaceAll(s, "wss://"+targetHost, "ws://"+proxyAddr)
+	s = strings.ReplaceAll(s, "ws://"+targetHost, "ws://"+proxyAddr)
 	// Also rewrite the protocol-relative form "//targetHost" (no scheme).
 	// This appears when upstream HTML uses src="//ctf.io/logo.png" style URLs.
 	// Step 1 (subdomainRe) covers "//sub.rootDomain" but not "//rootDomain" itself.
@@ -732,6 +780,8 @@ func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe
 	if rootDomain != "" && rootDomain != targetHost {
 		s = strings.ReplaceAll(s, "https://"+rootDomain, proxyBase)
 		s = strings.ReplaceAll(s, "http://"+rootDomain, proxyBase)
+		s = strings.ReplaceAll(s, "wss://"+rootDomain, "ws://"+proxyAddr)
+		s = strings.ReplaceAll(s, "ws://"+rootDomain, "ws://"+proxyAddr)
 		s = strings.ReplaceAll(s, "//"+rootDomain+"/", "//"+proxyAddr+"/")
 		s = strings.ReplaceAll(s, "//"+rootDomain+"\"", "//"+proxyAddr+"\"")
 		s = strings.ReplaceAll(s, "//"+rootDomain+"'", "//"+proxyAddr+"'")
@@ -749,11 +799,17 @@ func maskResponseString(s, targetHost, rootDomain, proxyAddr string, subdomainRe
 			if len(sub) < 3 {
 				return match
 			}
+			// Detect WebSocket scheme — use ws:// prefix instead of http://.
+			schemePrefix := proxyBase
+			lowerMatch := strings.ToLower(sub[1])
+			if strings.HasPrefix(lowerMatch, "wss:") || strings.HasPrefix(lowerMatch, "ws:") {
+				schemePrefix = "ws://" + proxyAddr
+			}
 			hostStr := sub[1]
 			if idx := strings.Index(hostStr, "//"); idx >= 0 {
 				hostStr = hostStr[idx+2:]
 			}
-			return proxyBase + subdomainPrefix + hostStr + sub[2]
+			return schemePrefix + subdomainPrefix + hostStr + sub[2]
 		})
 	}
 
@@ -1026,6 +1082,31 @@ func rewriteCSP(csp, targetHost, rootDomain, proxyAddr string, alsoProxyDomains 
 			if !alreadyUnsafe {
 				rewritten = append(rewritten, "'unsafe-inline'")
 			}
+
+		}
+
+		// Always inject 'unsafe-eval' and 'wasm-unsafe-eval' into script
+		// execution directives.  The proxy rewrites inline scripts and
+		// response bodies, which can break eval-based and WASM patterns.
+		// This must be outside the hadHash block so that pages whose CSP
+		// uses nonces (without hashes) also get these tokens.
+		if name == "script-src" || name == "script-src-elem" || name == "default-src" {
+			hasUnsafeEval := false
+			hasWasmUnsafeEval := false
+			for _, t := range rewritten[1:] {
+				switch strings.ToLower(t) {
+				case "'unsafe-eval'":
+					hasUnsafeEval = true
+				case "'wasm-unsafe-eval'":
+					hasWasmUnsafeEval = true
+				}
+			}
+			if !hasUnsafeEval {
+				rewritten = append(rewritten, "'unsafe-eval'")
+			}
+			if !hasWasmUnsafeEval {
+				rewritten = append(rewritten, "'wasm-unsafe-eval'")
+			}
 		}
 		out = append(out, strings.Join(rewritten, " "))
 	}
@@ -1206,6 +1287,13 @@ func unmaskRequestString(s, targetHost, scheme, proxyAddr string) string {
 	}
 	upstreamBase := scheme + "://" + targetHost
 	s = strings.ReplaceAll(s, "http://"+proxyAddr, upstreamBase)
+	// Rewrite WebSocket proxy URLs back to upstream: ws://proxyAddr → wss://targetHost
+	// (or ws://targetHost when scheme is "http" i.e. -insecure mode).
+	wsUpstream := "ws://" + targetHost
+	if scheme == "https" {
+		wsUpstream = "wss://" + targetHost
+	}
+	s = strings.ReplaceAll(s, "ws://"+proxyAddr, wsUpstream)
 	// Also rewrite the protocol-relative form "//proxyAddr" that may appear in
 	// request headers like Referer or Origin when the browser constructs them
 	// from a page served via the proxy.
@@ -1405,6 +1493,13 @@ func (s *wsFrameParseState) feed(data []byte, id uint64, dir string, logger *Log
 		}
 
 		// Accumulate header bytes one at a time.
+		if s.headerLen >= len(s.header) {
+			// Corrupted/unexpected frame — reset and skip this byte to resync.
+			s.headerLen = 0
+			s.need = 0
+			pos++
+			continue
+		}
 		s.header[s.headerLen] = data[pos]
 		s.headerLen++
 		pos++
@@ -1485,7 +1580,15 @@ type wsLoggingConn struct {
 func (c *wsLoggingConn) Read(b []byte) (int, error) {
 	n, err := c.rwc.Read(b)
 	if n > 0 {
-		c.rstate.feed(b[:n], c.id, "WS↓", c.logger)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					c.logger.Printf("WS frame parse panic (read): %v", r)
+					c.rstate = wsFrameParseState{} // reset
+				}
+			}()
+			c.rstate.feed(b[:n], c.id, "WS↓", c.logger)
+		}()
 	}
 	return n, err
 }
@@ -1494,7 +1597,15 @@ func (c *wsLoggingConn) Read(b []byte) (int, error) {
 func (c *wsLoggingConn) Write(b []byte) (int, error) {
 	n, err := c.rwc.Write(b)
 	if n > 0 {
-		c.wstate.feed(b[:n], c.id, "WS↑", c.logger)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					c.logger.Printf("WS frame parse panic (write): %v", r)
+					c.wstate = wsFrameParseState{} // reset
+				}
+			}()
+			c.wstate.feed(b[:n], c.id, "WS↑", c.logger)
+		}()
 	}
 	return n, err
 }
@@ -1528,7 +1639,7 @@ func (c *wsLoggingConn) Close() error { return c.rwc.Close() }
 // of the target) whose URLs should be routed through the proxy via /__sd__/.
 // Useful for CDN domains on different TLDs that share content with the target
 // (e.g. bbci.co.uk for www.bbc.com). Pass nil to disable.
-func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger, extraHeaders []headerPair, ignoredHosts map[string]bool, maxBodyBytes int64, alsoProxy []string, store *TrafficStore) *httputil.ReverseProxy {
+func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger, extraHeaders []headerPair, ignoredHosts map[string]bool, maxBodyBytes int64, alsoProxy []string, store *TrafficStore, stripCSP bool) *httputil.ReverseProxy {
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = maxBodyRewriteDefault
 	}
@@ -1562,7 +1673,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// Build pattern with a mandatory domain-boundary assertion.
 		// Group 1 = scheme+host, Group 2 = the character that terminates the host.
 		subdomainRe = regexp.MustCompile(
-			`(?i)((?:https?:)?//(?:[a-zA-Z0-9][-a-zA-Z0-9]*\.)+` +
+			`(?i)((?:https?:|wss?:)?//(?:[a-zA-Z0-9][-a-zA-Z0-9]*\.)+` +
 				regexp.QuoteMeta(rootDomain) +
 				`(?::\d+)?)([/?#"'\s\x00]|$)`,
 		)
@@ -1601,7 +1712,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		}
 		if len(parts) > 0 {
 			alsoProxyRe = regexp.MustCompile(
-				`(?i)((?:https?:)?//(?:` + strings.Join(parts, "|") + `)(?::\d+)?)([/?#"'\s\x00]|$)`,
+				`(?i)((?:https?:|wss?:)?//(?:` + strings.Join(parts, "|") + `)(?::\d+)?)([/?#"'\s\x00]|$)`,
 			)
 		}
 	}
@@ -2127,13 +2238,17 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			return nil
 		}
 
-		// Rewrite Content-Security-Policy: replace target-domain host sources
-		// with the proxy's own address so the browser can load resources without
-		// CSP violations.  This is done separately from the generic loop because
-		// CSP values need token-level parsing (not simple string replacement).
-		for _, cspKey := range []string{"Content-Security-Policy", "Content-Security-Policy-Report-Only"} {
-			for i, v := range resp.Header[cspKey] {
-				resp.Header[cspKey][i] = rewriteCSP(v, targetHost, rootDomain, effectiveProxyAddr, alsoProxyDomains)
+		// Handle Content-Security-Policy headers: either strip them entirely
+		// (-strip-csp) or rewrite target-domain host sources to the proxy's
+		// own address so the browser can load resources without CSP violations.
+		if stripCSP {
+			resp.Header.Del("Content-Security-Policy")
+			resp.Header.Del("Content-Security-Policy-Report-Only")
+		} else {
+			for _, cspKey := range []string{"Content-Security-Policy", "Content-Security-Policy-Report-Only"} {
+				for i, v := range resp.Header[cspKey] {
+					resp.Header[cspKey][i] = rewriteCSP(v, targetHost, rootDomain, effectiveProxyAddr, alsoProxyDomains)
+				}
 			}
 		}
 
@@ -2467,6 +2582,35 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// might have been rewritten if the replacer has active pairs.
 		if strings.HasPrefix(contentType, "text/html") {
 			rewritten = sriIntegrityRe.ReplaceAllString(rewritten, "")
+		}
+
+		// Pass 2c: strip <meta http-equiv="Content-Security-Policy" ...> tags.
+		// Browsers honour CSP from meta tags as well as headers; when -strip-csp
+		// is active we must remove both delivery mechanisms.
+		if stripCSP && strings.HasPrefix(contentType, "text/html") {
+			rewritten = metaCSPRe.ReplaceAllString(rewritten, "")
+		}
+
+		// Inject WebSocket wss→ws downgrade script into ALL HTML pages.
+		// JS code that constructs "wss://" + location.host dynamically at
+		// runtime bypasses body-level string replacement; this script
+		// intercepts the WebSocket constructor and fixes the scheme.
+		if strings.HasPrefix(contentType, "text/html") {
+			wsScript := fmt.Sprintf(wsDowngradeScript, effectiveProxyAddr)
+			// Reuse any nonce already found for the subdomain SPA script,
+			// or extract one now for main-target pages.
+			if m := scriptNonceRe.FindStringSubmatch(rewritten); m != nil {
+				nonce := m[1]
+				if nonce == "" {
+					nonce = m[2]
+				}
+				if nonce != "" {
+					wsScript = strings.Replace(wsScript, "<script>", `<script nonce="`+nonce+`">`, 1)
+				}
+			}
+			rewritten = headTagRe.ReplaceAllStringFunc(rewritten, func(tag string) string {
+				return tag + wsScript
+			})
 		}
 
 		var replaceCount int
