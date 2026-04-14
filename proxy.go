@@ -1765,12 +1765,27 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 				}
 				return false
 			}
+			// For domain validation strip the port (if present) so that
+			// "cdn.example.com:8443" is recognised as a subdomain of "example.com".
+			// For IP-addressed targets we keep the full host:port — different ports
+			// on the same IP are different services, not "subdomains".
+			// The original subHostLower (with port) is preserved in req.URL.Host so
+			// Go's HTTP client connects to the correct port.
+			subHostname := subHostLower
+			if h, _, err := net.SplitHostPort(subHostLower); err == nil && net.ParseIP(h) == nil {
+				subHostname = h
+			}
 			validSubdomain := !hostnameInvalid(subHostLower) &&
-				(subHostLower == rootLower || strings.HasSuffix(subHostLower, "."+rootLower))
+				(subHostname == rootLower || strings.HasSuffix(subHostname, "."+rootLower))
 			// Also allow hosts from the -also-proxy whitelist.
 			if !validSubdomain && len(alsoProxyDomains) > 0 && !hostnameInvalid(subHostLower) {
 				for extra := range alsoProxyDomains {
-					if subHostLower == extra || strings.HasSuffix(subHostLower, "."+extra) {
+					// Strip port from extra (domain names only) for robust matching.
+					extraHostname := extra
+					if h, _, err := net.SplitHostPort(extra); err == nil && net.ParseIP(h) == nil {
+						extraHostname = h
+					}
+					if subHostname == extraHostname || strings.HasSuffix(subHostname, "."+extraHostname) {
 						validSubdomain = true
 						break
 					}

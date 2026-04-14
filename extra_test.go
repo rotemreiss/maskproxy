@@ -4586,3 +4586,48 @@ if !step2Hit {
 t.Error("protocol-relative redirect was not followed")
 }
 }
+
+// TestSubdomainExplicitPortNotBlocked verifies that a /__sd__/ request for a
+// subdomain with an explicit port (e.g. cdn.example.com:8443) is routed
+// correctly and NOT blocked by the SSRF guard.
+// Before the fix, HasSuffix("cdn.example.com:8443", ".example.com") == false,
+// so the SSRF guard incorrectly returned 403 for valid subdomains with ports.
+func TestSubdomainExplicitPortNotBlocked(t *testing.T) {
+	// CDN upstream on a non-standard port.
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "cdn-content")
+	}))
+	defer cdn.Close()
+	// cdn address is 127.0.0.1:PORT (e.g. "127.0.0.1:57423").
+	cdnAddr := cdn.Listener.Addr().String()
+
+	// Main upstream returns simple HTML.
+	main := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html><body>hello</body></html>")
+	}))
+	defer main.Close()
+
+	host := strings.TrimPrefix(main.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9820", true, 0, newDiscardLogger(), nil, nil, 0, []string{cdnAddr})
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	// Request via /__sd__/ with explicit port -- must NOT return 403.
+	resp, err := ps.Client().Get(ps.URL + "/__sd__/" + cdnAddr + "/asset.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Errorf("SSRF guard incorrectly blocked subdomain with explicit port %s", cdnAddr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "cdn-content" {
+		t.Errorf("expected cdn-content, got %q", string(body))
+	}
+}
