@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 const usage = `maskproxy — a transparent rewriting reverse proxy
@@ -210,7 +211,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Enforce a minimum alias length of 5 characters.
+	// Enforce a minimum alias length of 5 characters (measured in Unicode code
+	// points, not bytes, so multi-byte characters are counted correctly).
 	// Short aliases (e.g. "ing", "com", "api") are extremely common substrings
 	// that appear in URLs, headers, and request bodies.  When the proxy rewrites
 	// outbound requests (alias→original) such a short alias will corrupt
@@ -218,7 +220,7 @@ func main() {
 	// This check runs at startup so the proxy never silently corrupts traffic.
 	const minAliasLen = 5
 	for _, p := range rep.Pairs() {
-		if len(p.Alias) < minAliasLen {
+		if utf8.RuneCountInString(p.Alias) < minAliasLen {
 			fmt.Fprintf(os.Stderr,
 				"error: alias %q (for %q) is only %d character(s) long.\n"+
 					"  Aliases shorter than %d characters are too common to be unique —\n"+
@@ -226,7 +228,7 @@ func main() {
 					"  every occurrence of %q with %q.\n"+
 					"  Example: /loading.js would become /lo%sg.js\n"+
 					"  Please choose a more unique alias (at least %d characters).\n",
-				p.Alias, p.Original, len(p.Alias), minAliasLen,
+				p.Alias, p.Original, utf8.RuneCountInString(p.Alias), minAliasLen,
 				p.Alias, p.Original, p.Original, minAliasLen,
 			)
 			os.Exit(1)

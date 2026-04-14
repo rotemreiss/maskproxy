@@ -16,7 +16,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -1653,11 +1652,14 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	// Example: alias "ing" for "microsoft" → "loading.js" contains "ing"
 	// surrounded by letters, so "loading.js" → "loaMicrosoftg.js".
 	//
-	// We use a sync.Once per alias so the warning is only emitted once even
-	// under concurrent request handling.  The map is keyed by the lowercase
-	// alias so the check is fast and allocation-free on the hot path.
+	// We use atomic.Bool (CAS) per alias so the warning is emitted exactly
+	// once even under concurrent request handling, while still checking every
+	// request until the first match fires.  A sync.Once would be wrong here
+	// because it is consumed on the first call regardless of whether the URL
+	// actually embeds the alias — meaning the warning would never fire if the
+	// very first proxied request happens not to trigger the condition.
 	type stabilityEntry struct {
-		once     sync.Once
+		warned   atomic.Bool // CAS to true on first warning emission
 		alias    string
 		original string
 		// embeddedRe matches the alias when it is preceded or followed by an
@@ -1674,11 +1676,12 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			`(?i)[A-Za-z0-9]` + regexp.QuoteMeta(alias) +
 				`|` + regexp.QuoteMeta(alias) + `[A-Za-z0-9]`,
 		)
-		stabilityChecks = append(stabilityChecks, &stabilityEntry{
+		sc := &stabilityEntry{
 			alias:      alias,
 			original:   original,
 			embeddedRe: embeddedRe,
-		})
+		}
+		stabilityChecks = append(stabilityChecks, sc)
 	}
 
 	director := func(req *http.Request) {
@@ -1712,19 +1715,24 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			tx.OriginalRequestHeaders = req.Header.Clone()
 		}
 
-		// Alias stability check — fires once per alias, on the first request.
+		// Alias stability check — checks every request until the first match fires.
 		// We inspect the raw client-visible path+query (before ToOriginal rewriting)
 		// and warn if any alias appears embedded inside a larger word.  That means
 		// the outbound rewrite will corrupt innocent strings; e.g. alias "ing" would
 		// turn "loading.js" into "loaMicrosoftg.js".
+		//
+		// We use atomic.Bool CAS (not sync.Once) so the check keeps running on every
+		// request until a match is found.  sync.Once would be consumed on the very
+		// first request even when that URL doesn't embed the alias, permanently
+		// silencing all future warnings.
 		//
 		// We check the URL (not bodies) because bodies may legitimately contain
 		// user-typed alias strings, while URL paths are proxy-routed and should
 		// never carry the alias embedded in an unrelated token.
 		rawClientURI := req.URL.RequestURI()
 		for _, sc := range stabilityChecks {
-			sc.once.Do(func() {
-				if sc.embeddedRe.MatchString(rawClientURI) {
+			if !sc.warned.Load() && sc.embeddedRe.MatchString(rawClientURI) {
+				if sc.warned.CompareAndSwap(false, true) {
 					msg := fmt.Sprintf(
 						"WARNING: alias %q (for %q) appears embedded inside a larger word"+
 							" in the request URL %q — the alias→original rewrite will"+
@@ -1738,7 +1746,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 						store.AddStabilityWarning(sc.alias, sc.original, rawClientURI)
 					}
 				}
-			})
+			}
 		}
 
 		req.URL.Scheme = target.Scheme

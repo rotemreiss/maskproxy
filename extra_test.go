@@ -34,6 +34,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // ─── isTextContent ───────────────────────────────────────────────────────────
@@ -4939,6 +4940,8 @@ wantErr bool
 {"microsoft:ing", true},             // alias "ing" = 3 chars — should fail
 {"ctf:acme,ctfd:foobar", true},      // "acme" = 4 — should fail
 {"ctf:acmec,ctfd:foobar", false},    // both ≥ 5 — OK
+// unicode: "ni\u00f1o" is 4 runes but 5 bytes; rune count must be used
+{"microsoft:ni\u00f1o", true},       // alias has 4 Unicode code points — should fail
 }
 
 for _, tc := range cases {
@@ -4949,7 +4952,7 @@ continue
 }
 var gotErr bool
 for _, p := range rep.Pairs() {
-if len(p.Alias) < minAliasLen {
+if utf8.RuneCountInString(p.Alias) < minAliasLen {
 gotErr = true
 break
 }
@@ -5070,5 +5073,53 @@ t.Errorf("first warning unexpected: %+v", ws[0])
 }
 if ws[1].Alias != "com" {
 t.Errorf("second warning unexpected: %+v", ws[1])
+}
+}
+
+// TestStabilityWarningFiredAfterNonMatchingRequests is a regression test for a
+// bug where sync.Once was used instead of atomic.Bool CAS.  With sync.Once the
+// warning was silently dropped when the very first request did not embed the
+// alias — because Once consumed the callback on first call regardless of the
+// URL, permanently skipping all future warnings.
+func TestStabilityWarningFiredAfterNonMatchingRequests(t *testing.T) {
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+w.WriteHeader(http.StatusOK)
+}))
+defer upstream.Close()
+
+upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
+store := NewTrafficStore()
+
+rep, err := NewReplacer("microsoft:loading", false)
+if err != nil {
+t.Fatalf("NewReplacer: %v", err)
+}
+
+proxy := NewReverseProxy(
+upstreamHost, "http", rep, true,
+"localhost:19997", false, 0,
+newDiscardLogger(), nil, nil, 50*1024*1024, nil, store,
+)
+
+srv := httptest.NewServer(proxy)
+defer srv.Close()
+
+// First three requests do NOT embed the alias — no warning expected yet.
+for _, path := range []string{"/", "/api/health", "/favicon.ico"} {
+if _, err := http.Get(srv.URL + path); err != nil {
+t.Fatalf("GET %s: %v", path, err)
+}
+}
+if w := store.StabilityWarnings(); len(w) != 0 {
+t.Errorf("expected no warnings before embedding request, got %d", len(w))
+}
+
+// Now send a request that embeds the alias — warning MUST fire.
+if _, err := http.Get(srv.URL + "/preloading.js"); err != nil {
+t.Fatalf("GET /preloading.js: %v", err)
+}
+warnings := store.StabilityWarnings()
+if len(warnings) != 1 {
+t.Errorf("expected 1 warning after embedding request, got %d (regression: sync.Once was consuming too early)", len(warnings))
 }
 }
