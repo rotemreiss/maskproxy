@@ -17,6 +17,7 @@ package main
 //     effectiveProxyAddr (127.0.0.1 → 127.0.0.1 in Location, not localhost)
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
@@ -4476,5 +4477,37 @@ func TestReplacerCIMixedCaseInput(t *testing.T) {
 	gotStr, count := r.ToOriginalDiff("ACME")
 	if gotStr != "ctf" || count != 1 {
 		t.Errorf("ToOriginalDiff(ACME) = %q, %d; want ctf, 1", gotStr, count)
+	}
+}
+
+// TestDirectorClientHostFallback verifies the clientHost == "" branch fires
+// when an HTTP/1.0 request arrives with no Host header.  The director falls
+// back to req.URL.Host in that case.  We craft a raw TCP request to the proxy.
+func TestDirectorClientHostFallback(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(upstream.Listener.Addr().String(), "http", rep, false, "", true, 0, testLogger(), nil, nil, 0, nil)
+	srv := httptest.NewServer(proxy)
+	defer srv.Close()
+
+	// Connect via raw TCP and send an HTTP/1.0 request with no Host header.
+	// Go's http.Server sets req.Host="" for HTTP/1.0 requests without Host.
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "GET / HTTP/1.0\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
 	}
 }
