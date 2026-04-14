@@ -4715,3 +4715,114 @@ t.Errorf("[%s]\n got  %q\n want %q", tc.desc, got, tc.want)
 }
 }
 }
+
+// TestRewriteRootRelativePathsSrcsetDescriptors verifies that srcset entries
+// with width/density descriptors (e.g. "300w", "2x") are correctly rewritten.
+func TestRewriteRootRelativePathsSrcsetDescriptors(t *testing.T) {
+	sub := "cdn.example.com"
+	pfx := "/__sd__/" + sub
+	cases := []struct {
+		desc, in, want string
+	}{
+		{
+			"srcset with width descriptors",
+			`<img srcset="/img/small.png 300w, /img/large.png 900w">`,
+			`<img srcset="` + pfx + `/img/small.png 300w, ` + pfx + `/img/large.png 900w">`,
+		},
+		{
+			"srcset with density descriptor",
+			`<source srcset="/img/photo.jpg 2x">`,
+			`<source srcset="` + pfx + `/img/photo.jpg 2x">`,
+		},
+		{
+			"srcset without descriptor",
+			`<img srcset="/img/only.png">`,
+			`<img srcset="` + pfx + `/img/only.png">`,
+		},
+	}
+	for _, tc := range cases {
+		got := rewriteRootRelativePaths(tc.in, sub)
+		if got != tc.want {
+			t.Errorf("[%s]\n got  %q\n want %q", tc.desc, got, tc.want)
+		}
+	}
+}
+
+// TestRewriteRootRelativePathsMetaRefresh verifies that meta-refresh redirect
+// URLs are rewritten to go through the subdomain proxy route.
+func TestRewriteRootRelativePathsMetaRefresh(t *testing.T) {
+	sub := "app.example.com"
+	pfx := "/__sd__/" + sub
+	in := `<meta http-equiv="refresh" content="5; url=/dashboard">`
+	want := `<meta http-equiv="refresh" content="5; url=` + pfx + `/dashboard">`
+	got := rewriteRootRelativePaths(in, sub)
+	if got != want {
+		t.Errorf("meta-refresh:\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestRewriteRootRelativePathsImportMapAlreadyPrefixed verifies idempotency:
+// importmap values already pointing into /__sd__/ are left untouched, while
+// root-relative keys in the same map are still rewritten.
+func TestRewriteRootRelativePathsImportMapAlreadyPrefixed(t *testing.T) {
+	sub := "cdn.example.com"
+	pfx := "/__sd__/" + sub
+	// Key "/app.js" should be rewritten; value already has pfx, should stay.
+	in := `<script type="importmap">{"imports":{"/app.js":"` + pfx + `/app.js"}}</script>`
+	got := rewriteRootRelativePaths(in, sub)
+	// Key gets rewritten → one more pfx occurrence; value is already prefixed → unchanged.
+	// Expected final value: key=pfx+"/app.js", value=pfx+"/app.js" → 2 occurrences of pfx.
+	if count := strings.Count(got, pfx); count != 2 {
+		t.Errorf("expected 2 occurrences of prefix (key rewritten, value preserved), got %d\n%s", count, got)
+	}
+	// The value must NOT be double-prefixed.
+	doublePrefix := pfx + pfx
+	if strings.Contains(got, doublePrefix) {
+		t.Errorf("double-prefix detected in output:\n%s", got)
+	}
+}
+
+// TestNewReverseProxyWithTrafficStore verifies that the proxy records transactions
+// into the TrafficStore when one is provided (store != nil code path).
+func TestNewReverseProxyWithTrafficStore(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html><body>hello store</body></html>")
+	}))
+	defer ts.Close()
+
+	host := strings.TrimPrefix(ts.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	store := NewTrafficStore()
+	store.Target = host
+
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9099", true, 0,
+		testLogger(), nil, nil, 0, nil, store)
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	resp, err := http.Get(proxySrv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// Poll for the transaction to be recorded (saveTx is called in modifyResponse,
+	// which is synchronous, but give some headroom for the HTTP stack).
+	var txns []*Transaction
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		txns = store.All()
+		if len(txns) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if len(txns) == 0 {
+		t.Fatal("expected at least one transaction in store after 500ms")
+	}
+	if txns[0].StatusCode != 200 {
+		t.Errorf("expected status 200, got %d", txns[0].StatusCode)
+	}
+}

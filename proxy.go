@@ -16,7 +16,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -45,6 +44,17 @@ var hopByHopHeaders = map[string]bool{
 // modifyResponse via the request context.  Using a typed key avoids clashes
 // with other context values.
 type clientHostContextKey struct{}
+
+// txContextKey threads the in-progress *Transaction from the director to
+// modifyResponse via the request context.  Go's ReverseProxy may create a
+// new *http.Request pointer after calling the director (e.g. for tracing), so
+// a sync.Map keyed by pointer is unreliable — context values are inherited
+// across WithContext clones and are the correct transport mechanism.
+type txContextKey struct{}
+
+// reqStartContextKey threads the request start time (for latency measurement)
+// from the director to modifyResponse via context, for the same reason.
+type reqStartContextKey struct{}
 
 // absURLRe matches absolute and protocol-relative URLs (used to protect
 // external links from being corrupted by user-defined string replacements).
@@ -1629,13 +1639,9 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	// where the proxy rewrites the Location back to itself indefinitely.
 	rt = &followTargetRedirectsTransport{rt: rt, rootDomain: rootDomain, scheme: scheme, alsoProxyDomains: alsoProxyDomains}
 
-	// reqTimes stores the start time recorded in the director so that
-	// modifyResponse can compute round-trip latency.  sync.Map is used because
-	// director and modifyResponse run concurrently for different requests.
-	var reqTimes sync.Map // key: *http.Request → value: time.Time
-	// txStore holds in-progress Transaction pointers (one per active request)
-	// so that the director and modifyResponse can cooperatively populate them.
-	var txStore sync.Map // key: *http.Request → value: *Transaction
+	// (reqTimes and txStore removed — both are now threaded via request context;
+	// see reqStartContextKey and txContextKey.  Context values are inherited
+	// across WithContext clones so they survive Go's internal request cloning.)
 
 	director := func(req *http.Request) {
 		// Capture the client-visible host (e.g. "127.0.0.1:9001" or "localhost:9001")
@@ -1794,7 +1800,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 					// upstream receives the correct Transfer-Encoding.
 					req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(raw), req.Body))
 					start := logger.LogRequest(req, "", false, 0)
-					reqTimes.Store(req, start)
+					*req = *req.WithContext(context.WithValue(req.Context(), reqStartContextKey{}, start))
 				} else {
 					req.Body.Close()
 					rewritten := string(raw)
@@ -1825,12 +1831,12 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 					req.Body = io.NopCloser(strings.NewReader(rewritten))
 					req.ContentLength = int64(len(rewritten))
 					start := logger.LogRequest(req, rewritten, false, replaceCount)
-					reqTimes.Store(req, start)
+					*req = *req.WithContext(context.WithValue(req.Context(), reqStartContextKey{}, start))
 				}
 			} else {
 				// Body read failed — still record timing so modifyResponse can log duration.
 				start := logger.LogRequest(req, "", false, 0)
-				reqTimes.Store(req, start)
+				*req = *req.WithContext(context.WithValue(req.Context(), reqStartContextKey{}, start))
 			}
 		} else {
 			// Bodyless request (GET, HEAD, etc.) — still log + record start time.
@@ -1839,7 +1845,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			// produce a matching response log line from ModifyResponse).
 			isWS := strings.EqualFold(req.Header.Get("Upgrade"), "websocket")
 			start := logger.LogRequest(req, "", isWS, 0)
-			reqTimes.Store(req, start)
+			*req = *req.WithContext(context.WithValue(req.Context(), reqStartContextKey{}, start))
 		}
 
 		// Inject user-defined extra headers (from -header flags).  Use Set so
@@ -1924,9 +1930,11 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			tx.ModifiedRequestBody = txModBody
 			tx.RequestReplaceCount = txBodyReplaceCount
 			tx.IsWS = strings.EqualFold(req.Header.Get("Upgrade"), "websocket")
-			// Store in txStore keyed by the request pointer; modifyResponse will
-			// retrieve it via the same pointer to add the response fields.
-			txStore.Store(req, tx)
+			// Embed the transaction in the request context so modifyResponse can
+			// find it even when Go's ReverseProxy creates a new *http.Request
+			// after the director returns (e.g. for httptrace injection).
+			// Context values are inherited by WithContext clones, so this is safe.
+			*req = *req.WithContext(context.WithValue(req.Context(), txContextKey{}, tx))
 		}
 	}
 
@@ -1934,15 +1942,15 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// Retrieve the start time stored by the director for this request.
 		// Use a zero time as fallback if somehow it wasn't stored.
 		var start time.Time
-		if v, ok := reqTimes.LoadAndDelete(resp.Request); ok {
-			start = v.(time.Time)
+		if v, ok := resp.Request.Context().Value(reqStartContextKey{}).(time.Time); ok {
+			start = v
 		}
 
 		// === UI: load in-progress transaction and define a save helper ===
 		var tx *Transaction
 		if store != nil {
-			if v, ok := txStore.LoadAndDelete(resp.Request); ok {
-				tx = v.(*Transaction)
+			if v, ok := resp.Request.Context().Value(txContextKey{}).(*Transaction); ok && v != nil {
+				tx = v
 			}
 		}
 		// saveTx finalises tx with response data and persists it to the store.
@@ -2411,9 +2419,8 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	}
 
 	errorHandler := func(w http.ResponseWriter, r *http.Request, err error) {
-		// Clean up the timing entry if the request never reached modifyResponse.
-		reqTimes.Delete(r)
-		txStore.Delete(r)
+		// Both the start time and the transaction are stored in the request
+		// context and will be GC'd automatically — no explicit cleanup needed.
 		logger.Printf("maskproxy: upstream error for %s %s: %v", r.Method, r.URL, err)
 		http.Error(w, "Bad Gateway: "+err.Error(), http.StatusBadGateway)
 	}
