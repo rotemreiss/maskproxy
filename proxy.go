@@ -1508,7 +1508,7 @@ func (c *wsLoggingConn) Close() error { return c.rwc.Close() }
 // of the target) whose URLs should be routed through the proxy via /__sd__/.
 // Useful for CDN domains on different TLDs that share content with the target
 // (e.g. bbci.co.uk for www.bbc.com). Pass nil to disable.
-func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger, extraHeaders []headerPair, ignoredHosts map[string]bool, maxBodyBytes int64, alsoProxy []string) *httputil.ReverseProxy {
+func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, proxyAddr string, exactDomain bool, upstreamTimeout time.Duration, logger *Logger, extraHeaders []headerPair, ignoredHosts map[string]bool, maxBodyBytes int64, alsoProxy []string, store *TrafficStore) *httputil.ReverseProxy {
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = maxBodyRewriteDefault
 	}
@@ -1623,6 +1623,9 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	// modifyResponse can compute round-trip latency.  sync.Map is used because
 	// director and modifyResponse run concurrently for different requests.
 	var reqTimes sync.Map // key: *http.Request → value: time.Time
+	// txStore holds in-progress Transaction pointers (one per active request)
+	// so that the director and modifyResponse can cooperatively populate them.
+	var txStore sync.Map // key: *http.Request → value: *Transaction
 
 	director := func(req *http.Request) {
 		// Capture the client-visible host (e.g. "127.0.0.1:9001" or "localhost:9001")
@@ -1864,6 +1867,42 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			start = v.(time.Time)
 		}
 
+		// === UI: load in-progress transaction and define a save helper ===
+		var tx *Transaction
+		if store != nil {
+			if v, ok := txStore.LoadAndDelete(resp.Request); ok {
+				tx = v.(*Transaction)
+			}
+		}
+		// saveTx finalises tx with response data and persists it to the store.
+		// Idempotent: no-ops when tx or store is nil (already saved / disabled).
+		saveTx := func(origBody, modBody string, replaceCount int) {
+			if tx == nil || store == nil {
+				return
+			}
+			tx.StatusCode = resp.StatusCode
+			tx.Duration = time.Since(start)
+			tx.ContentType = resp.Header.Get("Content-Type")
+			tx.ResponseHeaders = resp.Header.Clone()
+			size := resp.ContentLength
+			if size < 0 {
+				size = int64(len(modBody))
+			}
+			tx.ResponseSize = size
+			if len(origBody) > uiBodyPreview {
+				origBody = origBody[:uiBodyPreview]
+			}
+			if len(modBody) > uiBodyPreview {
+				modBody = modBody[:uiBodyPreview]
+			}
+			tx.OriginalResponseBody = origBody
+			tx.ModifiedResponseBody = modBody
+			tx.ResponseReplaceCount = replaceCount
+			store.Save(tx)
+			tx = nil // prevent double-save
+		}
+		_ = saveTx // used in multiple branches below
+
 		// Per-request effective proxy address: use the client-facing Host that
 		// the browser sent (captured in the director via context) so that rewritten
 		// URLs in the response body and Location headers use the same hostname
@@ -1930,6 +1969,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// are never corrupted by user-defined replacement pairs.
 		if ignored.contains(resp.Request.URL.Host) {
 			logger.LogResponse(resp, "", start, 0)
+			saveTx("", "", 0)
 			return nil
 		}
 
@@ -2061,6 +2101,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			// Unknown encoding (br, zstd, …) — forward body unchanged and skip rewriting.
 			logger.Printf("maskproxy: skipping body rewrite: unsupported Content-Encoding %q", ce)
 			logger.LogResponse(resp, "", start, 0)
+			saveTx("", "", 0)
 			return nil
 		}
 		if isGzip {
@@ -2068,6 +2109,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			if err != nil {
 				logger.Printf("maskproxy: failed to decode gzip response: %v", err)
 				logger.LogResponse(resp, "", start, 0)
+				saveTx("", "", 0)
 				return nil
 			}
 			defer gz.Close()
@@ -2106,6 +2148,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 				logger.Printf("maskproxy: failed to decode deflate response: %v", err)
 				resp.Body = io.NopCloser(bytes.NewReader(compressedDeflate))
 				logger.LogResponse(resp, "", start, 0)
+				saveTx("", "", 0)
 				return nil
 			}
 			defer dr.Close()
@@ -2126,6 +2169,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		if int64(len(raw)) > maxBodyBytes {
 			logger.Printf("maskproxy: response body exceeds %d bytes; skipping rewrite", maxBodyBytes)
 			logger.LogResponse(resp, "", start, 0)
+			saveTx("", "", 0)
 			switch {
 			case isDeflate:
 				resp.Header.Set("Content-Encoding", "deflate")
@@ -2299,12 +2343,14 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		resp.Header.Del("Transfer-Encoding")
 
 		logger.LogResponse(resp, rewritten, start, replaceCount)
+		saveTx(string(raw), rewritten, replaceCount)
 		return nil
 	}
 
 	errorHandler := func(w http.ResponseWriter, r *http.Request, err error) {
 		// Clean up the timing entry if the request never reached modifyResponse.
 		reqTimes.Delete(r)
+		txStore.Delete(r)
 		logger.Printf("maskproxy: upstream error for %s %s: %v", r.Method, r.URL, err)
 		http.Error(w, "Bad Gateway: "+err.Error(), http.StatusBadGateway)
 	}

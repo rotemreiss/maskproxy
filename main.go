@@ -159,6 +159,7 @@ func main() {
 	listen := flag.String("listen", "0.0.0.0", "Local listen address")
 	drain := flag.Duration("drain", 15*time.Second, "Grace period for in-flight requests on SIGINT/SIGTERM")
 	maxBody := flag.Int64("max-body", 50, "Maximum response/request body size to buffer for rewriting, in MiB (0 = default 50 MiB)")
+	uiPort := flag.Int("ui-port", 4040, "Port for the traffic inspection UI (0 to disable)")
 	var headers headerFlag
 	flag.Var(&headers, "header", `Add a header to every upstream request (repeatable). Format: "Name: Value". Example: -header "X-Author: Rotem"`)
 	var ignoreHosts ignoreHostFlag
@@ -249,7 +250,25 @@ func main() {
 
 	pAddr := proxyAddr(*listen, *port)
 	maxBodyBytes := *maxBody * 1024 * 1024
-	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger, extraHeaders, ignoredHostsMap, maxBodyBytes, alsoProxyDomains)
+
+	// Build UI traffic store (populated via proxy hooks; displayed on -ui-port).
+	trafficStore := NewTrafficStore()
+	trafficStore.Target = *target
+	trafficStore.Replacements = buildReplacementPairs(rep)
+	{
+		sorted := make([]string, 0, len(ignoredHostsMap))
+		for h := range ignoredHostsMap {
+			if strings.HasPrefix(h, ".") {
+				sorted = append(sorted, "*"+h)
+			} else {
+				sorted = append(sorted, h)
+			}
+		}
+		sort.Strings(sorted)
+		trafficStore.IgnoredHosts = sorted
+	}
+
+	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger, extraHeaders, ignoredHostsMap, maxBodyBytes, alsoProxyDomains, trafficStore)
 
 	addr := fmt.Sprintf("%s:%d", *listen, *port)
 	logger.Printf("maskproxy listening on http://%s", addr)
@@ -312,6 +331,18 @@ func main() {
 		logger.Printf("  → log file: %s", *logFile)
 	}
 
+	// Start the UI inspection server on a separate port.
+	if *uiPort > 0 {
+		uiAddr := fmt.Sprintf("0.0.0.0:%d", *uiPort)
+		uiSrv := NewUIServer(trafficStore, uiAddr)
+		go func() {
+			if err := uiSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Printf("maskproxy: UI server error: %v", err)
+			}
+		}()
+		logger.Printf("  → UI:  http://localhost:%d", *uiPort)
+	}
+
 	// Use http.Server instead of http.ListenAndServe so we can call Shutdown.
 	// On SIGINT (Ctrl+C) or SIGTERM the server stops accepting new connections
 	// and waits up to -drain seconds for in-flight requests to complete before
@@ -352,6 +383,19 @@ func main() {
 			logger.Printf("maskproxy: shutdown complete")
 		}
 	}
+}
+
+// buildReplacementPairs extracts the configured Pair list from a Replacer for
+// display in the UI.  Returns nil when no pairs are configured.
+func buildReplacementPairs(rep *Replacer) []ReplacementPair {
+	if rep == nil || !rep.HasPairs() {
+		return nil
+	}
+	pairs := make([]ReplacementPair, len(rep.forResponse))
+	for i, p := range rep.forResponse {
+		pairs[i] = ReplacementPair{Original: p.Original, Alias: p.Alias}
+	}
+	return pairs
 }
 
 // proxyAddr returns the host:port string that clients use to reach the proxy.
