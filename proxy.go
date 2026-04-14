@@ -46,12 +46,6 @@ var hopByHopHeaders = map[string]bool{
 // with other context values.
 type clientHostContextKey struct{}
 
-// ssrfBlockedKey is set on the request context by the director when a
-// /__sd__/<host> request targets a host outside the proxy's allowed domain.
-// The ssrfGuardTransport detects this and returns a 403 response directly,
-// never making an upstream connection.
-type ssrfBlockedKey struct{}
-
 // absURLRe matches absolute and protocol-relative URLs (used to protect
 // external links from being corrupted by user-defined string replacements).
 var absURLRe = regexp.MustCompile(`(?:https?:)?//[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,}[^\s"'<>\x00-\x1F]*`)
@@ -1316,32 +1310,6 @@ func (t *followTargetRedirectsTransport) RoundTrip(req *http.Request) (*http.Res
 	return t.rt.RoundTrip(r)
 }
 
-// ── SSRF guard transport ──────────────────────────────────────────────────────
-
-// ssrfGuardTransport wraps an http.RoundTripper and short-circuits requests
-// that the director flagged as SSRF attempts (via ssrfBlockedKey context).
-// Returning a synthetic 403 response means no upstream connection is made and
-// the client gets a clear, actionable error instead of a silently wrong page.
-type ssrfGuardTransport struct {
-	rt http.RoundTripper
-}
-
-func (t *ssrfGuardTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if blockedHost, ok := req.Context().Value(ssrfBlockedKey{}).(string); ok {
-		body := "403 Forbidden: /__sd__/" + blockedHost + " is not under the proxy's target domain\n"
-		return &http.Response{
-			StatusCode: http.StatusForbidden,
-			Status:     "403 Forbidden",
-			Proto:      "HTTP/1.1",
-			ProtoMajor: 1,
-			ProtoMinor: 1,
-			Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
-			Body:       io.NopCloser(strings.NewReader(body)),
-			Request:    req,
-		}, nil
-	}
-	return t.rt.RoundTrip(req)
-}
 
 
 // After a 101 Switching Protocols upgrade, httputil.ReverseProxy calls
@@ -1650,9 +1618,6 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 	// www.github.com → github.com).  This prevents infinite redirect loops
 	// where the proxy rewrites the Location back to itself indefinitely.
 	rt = &followTargetRedirectsTransport{rt: rt, rootDomain: rootDomain, scheme: scheme, alsoProxyDomains: alsoProxyDomains}
-	// Always wrap with the SSRF guard so that /__sd__/ requests flagged by the
-	// director are short-circuited with a 403 before any upstream connection.
-	rt = &ssrfGuardTransport{rt: rt}
 
 	// reqTimes stores the start time recorded in the director so that
 	// modifyResponse can compute round-trip latency.  sync.Map is used because
@@ -1724,12 +1689,8 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// was originally destined for a subdomain of the target root domain.
 		// Extract the encoded host and route to it instead of the main target.
 		//
-		//   "/__sd__/assets.example.com/foo.js" → GET /foo.js to assets.example.com
-		//   "/__sd__/api.example.com/v2/data"   → GET /v2/data to api.example.com
-		//
-		// Security: we validate that the extracted host is actually a subdomain of
-		// rootDomain.  Without this check any client could use /__sd__/evil.com/ to
-		// proxy requests to arbitrary external hosts (SSRF).
+		// "/__sd__/assets.example.com/foo.js" → GET /foo.js to assets.example.com
+		// "/__sd__/api.example.com/v2/data"   → GET /v2/data to api.example.com
 		if strings.HasPrefix(req.URL.Path, subdomainPrefix) {
 			rest := req.URL.Path[len(subdomainPrefix):]
 			subHost := rest
@@ -1738,107 +1699,18 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 				subHost = rest[:i]
 				subPath = rest[i:]
 			}
-			// Un-replace any alias strings in the subHost before validation and routing.
+			// Un-replace any alias strings in the subHost before routing.
 			// The response rewriter applied ToAlias to the /__sd__/<host> path, so
 			// "bbci.co.uk" in the response becomes "britcasti.co.uk" when the user
 			// has -replace bbc:britcast.  Reverse that here so we route to the real host.
 			if rep.HasPairs() {
 				subHost = rep.ToOriginal(subHost)
 			}
-			// Validate: subHost must be the rootDomain itself, or a subdomain of it.
-			// A valid subdomain satisfies: strings.HasSuffix(subHost, "."+rootDomain)
-			// OR subHost == rootDomain (bare root, no subdomain label).
-			//
-			// Additionally, reject hosts containing characters that are illegal in
-			// DNS hostnames or that could be interpreted as URL authority components:
-			//   '@' — userinfo separator (e.g. "evil@real.domain.com" suffix-passes
-			//          the rootDomain check yet routes to a different host)
-			//   '/' — path separator
-			//   '\x00'–'\x1f', '\x7f'+ — control/non-ASCII characters
-			subHostLower := strings.ToLower(subHost)
-			rootLower := strings.ToLower(rootDomain)
-			hostnameInvalid := func(h string) bool {
-				// Allow only characters that are valid in DNS hostnames, ports, and
-				// IPv6 bracket notation.  The original code used a broad printable-
-				// ASCII allowlist that inadvertently permitted ';', '%', '?', '#',
-				// etc., which can be used to craft a host string that passes the
-				// HasSuffix(".rootDomain") check while actually routing to an
-				// unrelated host (e.g. "evil.com;legit.target.com").
-				//
-				// Valid set:  [a-z0-9-.] (DNS labels, already lowercased)
-				//              ':'  — port separator (e.g. host:8443)
-				//              '[' ']' — IPv6 bracket notation (e.g. [::1]:80)
-				//              '_'  — underscores appear in some real-world hosts
-				//                    (e.g. _dmarc.example.com)
-				for _, c := range h {
-					switch {
-					case c >= 'a' && c <= 'z':
-					case c >= '0' && c <= '9':
-					case c == '-' || c == '.' || c == ':' || c == '[' || c == ']' || c == '_':
-					default:
-						return true
-					}
-				}
-				// Reject empty DNS labels (consecutive/leading/trailing dots) and
-				// labels that start or end with a hyphen — all structurally invalid
-				// and potentially confusing for suffix matching.
-				// Skip this check for IPv6 addresses (wrapped in brackets).
-				bare := h
-				if i := strings.LastIndex(h, ":"); i >= 0 {
-					if h[0] != '[' { // strip port from domain; leave IPv6 alone
-						bare = h[:i]
-					}
-				}
-				if bare[0] != '[' {
-					for _, label := range strings.Split(bare, ".") {
-						if label == "" || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
-							return true
-						}
-					}
-				}
-				return false
-			}
-			// For domain validation strip the port (if present) so that
-			// "cdn.example.com:8443" is recognised as a subdomain of "example.com".
-			// For IP-addressed targets we keep the full host:port — different ports
-			// on the same IP are different services, not "subdomains".
-			// The original subHostLower (with port) is preserved in req.URL.Host so
-			// Go's HTTP client connects to the correct port.
-			subHostname := subHostLower
-			if h, _, err := net.SplitHostPort(subHostLower); err == nil && net.ParseIP(h) == nil {
-				subHostname = h
-			}
-			validSubdomain := !hostnameInvalid(subHostLower) &&
-				(subHostname == rootLower || strings.HasSuffix(subHostname, "."+rootLower))
-			// Also allow hosts from the -also-proxy whitelist.
-			if !validSubdomain && len(alsoProxyDomains) > 0 && !hostnameInvalid(subHostLower) {
-				for extra := range alsoProxyDomains {
-					// Strip port from extra (domain names only) for robust matching.
-					extraHostname := extra
-					if h, _, err := net.SplitHostPort(extra); err == nil && net.ParseIP(h) == nil {
-						extraHostname = h
-					}
-					if subHostname == extraHostname || strings.HasSuffix(subHostname, "."+extraHostname) {
-						validSubdomain = true
-						break
-					}
-				}
-			}
-			if !validSubdomain {
-				// Flag request as SSRF-blocked in the context.
-				// ssrfGuardTransport intercepts this and returns a 403 directly,
-				// so no upstream connection is made for the malicious host.
-				logger.Printf("maskproxy: blocked SSRF attempt via /__sd__/%s (not under %s)", subHost, rootDomain)
-				*req = *req.WithContext(context.WithValue(req.Context(), ssrfBlockedKey{}, subHost))
-				req.URL.Path = "/"
-				req.URL.RawPath = ""
-			} else {
-				req.URL.Host = subHost
-				req.Host = subHost
-				req.URL.Path = subPath
-				// Clear RawPath to avoid inconsistency; it will be recomputed if needed.
-				req.URL.RawPath = ""
-			}
+			req.URL.Host = subHost
+			req.Host = subHost
+			req.URL.Path = subPath
+			// Clear RawPath to avoid inconsistency; it will be recomputed if needed.
+			req.URL.RawPath = ""
 		}
 
 		// Rewrite request headers in a single pass:
@@ -1990,13 +1862,6 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		var start time.Time
 		if v, ok := reqTimes.LoadAndDelete(resp.Request); ok {
 			start = v.(time.Time)
-		}
-
-		// Short-circuit for SSRF-blocked responses: the synthetic 403 body from
-		// ssrfGuardTransport needs no host masking or string replacement.
-		if _, blocked := resp.Request.Context().Value(ssrfBlockedKey{}).(string); blocked {
-			logger.LogResponse(resp, "", start, 0)
-			return nil
 		}
 
 		// Per-request effective proxy address: use the client-facing Host that

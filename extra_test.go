@@ -4588,10 +4588,8 @@ t.Error("protocol-relative redirect was not followed")
 }
 
 // TestSubdomainExplicitPortNotBlocked verifies that a /__sd__/ request for a
-// subdomain with an explicit port (e.g. cdn.example.com:8443) is routed
-// correctly and NOT blocked by the SSRF guard.
-// Before the fix, HasSuffix("cdn.example.com:8443", ".example.com") == false,
-// so the SSRF guard incorrectly returned 403 for valid subdomains with ports.
+// host with an explicit port (e.g. 127.0.0.1:8443) is routed correctly to
+// the specified host:port.
 func TestSubdomainExplicitPortNotBlocked(t *testing.T) {
 	// CDN upstream on a non-standard port.
 	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4673,79 +4671,4 @@ func TestSubdomainExplicitPortURLRewritten(t *testing.T) {
 	}
 }
 
-// TestSSRFSemicolonBypassBlocked verifies that a crafted /__sd__/ host containing
-// a semicolon (e.g. "evil.com;legit.target.com") is blocked by the SSRF guard.
-// Before the hostnameInvalid fix, ';' (0x3B) was allowed by the printable-ASCII
-// check.  HasSuffix("evil.com;legit.target.com", ".target.com") == true, so the
-// guard would have passed and routed to evil.com.
-func TestSSRFSemicolonBypassBlocked(t *testing.T) {
-	ssrfTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("SSRF: request reached forbidden host %s", r.Host)
-		fmt.Fprint(w, "ssrf")
-	}))
-	defer ssrfTarget.Close()
 
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "ok")
-	}))
-	defer upstream.Close()
-
-	host := strings.TrimPrefix(upstream.URL, "http://")
-	rep, _ := NewReplacer("", false)
-	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil, 0, nil)
-	ps := httptest.NewServer(proxy)
-	defer ps.Close()
-
-	// Craft a host like "127.0.0.1:PORT;legit.127.0.0.1:PORT2".
-	// The semicolon-separated suffix looks like it passes HasSuffix check.
-	ssrfHost := strings.TrimPrefix(ssrfTarget.URL, "http://")
-	// Build: ssrfHost + ";" + host  -- HasSuffix(this, "."+host) is true if host has a dot
-	// For simplicity just use a semicolon-containing host string.
-	craftedHost := ssrfHost + ";" + host
-	resp, err := ps.Client().Get(ps.URL + "/__sd__/" + craftedHost + "/secret")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("expected 403 for semicolon-bypass attempt, got %d", resp.StatusCode)
-	}
-}
-
-
-// TestSSRFDoubleDotBypassBlocked verifies that hostnames with empty DNS labels
-// (leading dots, consecutive dots) are rejected by the SSRF guard even though
-// dot is in the hostnameInvalid allowlist.  e.g. "..target.com" passes
-// HasSuffix("..target.com", ".target.com") but is an invalid hostname.
-func TestSSRFDoubleDotBypassBlocked(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "ok")
-	}))
-	defer upstream.Close()
-	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
-
-	rep, _ := NewReplacer("", false)
-	rp := NewReverseProxy(upstreamHost, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil, 0, nil)
-	srv := httptest.NewServer(rp)
-	defer srv.Close()
-
-	// Test hostname patterns with empty labels or label-starting/ending hyphens.
-	// None of these are valid DNS hostnames and all should be rejected.
-	bypassAttempts := []string{
-		"..example.com",
-		".example.com",
-		"x..example.com",
-		"-bad.example.com",
-		"bad-.example.com",
-	}
-	for _, host := range bypassAttempts {
-		resp, err := http.Get(srv.URL + "/__sd__/" + host + "/secret")
-		if err != nil {
-			t.Fatalf("request failed for %q: %v", host, err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusForbidden {
-			t.Errorf("expected 403 for invalid-label bypass %q, got %d", host, resp.StatusCode)
-		}
-	}
-}

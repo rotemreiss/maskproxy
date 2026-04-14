@@ -132,7 +132,7 @@ maskproxy -target www.bbc.com -replace bbc:britcast \
 - **WebSocket** connections are transparently proxied. WS frames are not string-replaced (binary framing), but opcodes and payload lengths are logged to stderr by default (`-ws-no-log` suppresses this).
 - **Subdomain routing**: upstream subdomains are encoded as `/__sd__/<subdomain>/path` in the proxy URL so the browser never needs to know about them directly.
 - **`-also-proxy` extra-domain routing**: domains listed with `-also-proxy` that are not subdomains of the target are also routed through `/__sd__/<host>/`, enabling full rewriting for assets from entirely separate CDN or API domains.
-- **SSRF guard**: only subdomains of the configured root domain are allowed through `/__sd__/`; hostnames containing `@` or path separators are rejected with HTTP 400.
+- **SSRF guard**: not applicable — maskproxy is a local development/CTF tool; anyone who can reach it already has access to the local system, so host restrictions on `/__sd__/` would provide no real security benefit. The `/__sd__/<host>/` route forwards to whatever host the browser requests.
 - **Graceful shutdown**: Ctrl+C / SIGTERM drains in-flight requests for up to `-drain` seconds before exiting.
 - **Replacement count** is logged on every request/response line so you can confirm replacements are firing without enabling `-verbose`.
 
