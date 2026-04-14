@@ -1758,8 +1758,24 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			subHostLower := strings.ToLower(subHost)
 			rootLower := strings.ToLower(rootDomain)
 			hostnameInvalid := func(h string) bool {
+				// Allow only characters that are valid in DNS hostnames, ports, and
+				// IPv6 bracket notation.  The original code used a broad printable-
+				// ASCII allowlist that inadvertently permitted ';', '%', '?', '#',
+				// etc., which can be used to craft a host string that passes the
+				// HasSuffix(".rootDomain") check while actually routing to an
+				// unrelated host.
+				//
+				// Valid set:  [a-z0-9-.] (DNS labels, already lowercased)
+				//              ':'  — port separator (e.g. host:8443)
+				//              '[' ']' — IPv6 bracket notation (e.g. [::1]:80)
+				//              '_'  — underscores appear in some real-world hosts
+				//                    (e.g. _dmarc.example.com)
 				for _, c := range h {
-					if c < 0x21 || c > 0x7e || c == '@' || c == '/' {
+					switch {
+					case c >= 'a' && c <= 'z':
+					case c >= '0' && c <= '9':
+					case c == '-' || c == '.' || c == ':' || c == '[' || c == ']' || c == '_':
+					default:
 						return true
 					}
 				}

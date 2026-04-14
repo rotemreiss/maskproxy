@@ -4672,3 +4672,42 @@ func TestSubdomainExplicitPortURLRewritten(t *testing.T) {
 		}
 	}
 }
+
+// TestSSRFSemicolonBypassBlocked verifies that a crafted /__sd__/ host containing
+// a semicolon (e.g. "evil.com;legit.target.com") is blocked by the SSRF guard.
+// Before the hostnameInvalid fix, ';' (0x3B) was allowed by the printable-ASCII
+// check.  HasSuffix("evil.com;legit.target.com", ".target.com") == true, so the
+// guard would have passed and routed to evil.com.
+func TestSSRFSemicolonBypassBlocked(t *testing.T) {
+	ssrfTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("SSRF: request reached forbidden host %s", r.Host)
+		fmt.Fprint(w, "ssrf")
+	}))
+	defer ssrfTarget.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil, 0, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	// Craft a host like "127.0.0.1:PORT;legit.127.0.0.1:PORT2".
+	// The semicolon-separated suffix looks like it passes HasSuffix check.
+	ssrfHost := strings.TrimPrefix(ssrfTarget.URL, "http://")
+	// Build: ssrfHost + ";" + host  -- HasSuffix(this, "."+host) is true if host has a dot
+	// For simplicity just use a semicolon-containing host string.
+	craftedHost := ssrfHost + ";" + host
+	resp, err := ps.Client().Get(ps.URL + "/__sd__/" + craftedHost + "/secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 for semicolon-bypass attempt, got %d", resp.StatusCode)
+	}
+}
