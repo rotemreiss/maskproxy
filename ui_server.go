@@ -442,12 +442,15 @@ function setupSSE() {
 /* ═══════════════════════════ Rendering ═══════════════════════════ */
 function renderStats(s) {
   document.getElementById('stat-total').textContent = fmt(s.total || 0);
+  // Show the most recent 1-minute bucket count as the "current" rate.
+  const pts = s.requestsPerMinute || [];
+  const lastMin = pts.length > 0 ? pts[pts.length - 1].count : 0;
+  document.getElementById('stat-rps').textContent = lastMin + ' req / current min';
   const errRate = (s.errorRate || 0).toFixed(1);
   document.getElementById('stat-errors').textContent = errRate + '%';
   document.getElementById('stat-latency').textContent = Math.round(s.avgDurationMs || 0) + 'ms';
   document.getElementById('stat-bytes').textContent = humanBytes(s.totalBytes || 0);
 
-  const pts = s.requestsPerMinute || [];
   const labels = pts.map(p => {
     const d = new Date(p.time);
     return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
@@ -534,13 +537,16 @@ function renderList() {
     const dur = tx.duration ? formatDuration(tx.duration) : '';
     const path = urlPath(tx.url);
     const replaced = (tx.requestReplaceCount || 0) + (tx.responseReplaceCount || 0);
+    const ts = tx.time ? new Date(tx.time).toLocaleTimeString() : '';
     return '<div class="req-item' + (tx.isIgnored?' ignored':'') + (tx.id===selectedId?' selected':'') + '" data-id="'+tx.id+'">' +
       '<span class="'+methodClass(m)+' '+m+'">'+esc(m)+'</span>' +
-      '<span class="req-url" title="'+esc(tx.url||'')+'">'+esc(path)+'</span>' +
+      '<span class="req-url" title="'+esc(normalizeUrl(tx.url)||tx.url||'')+'">'+esc(path)+'</span>' +
       '<span class="req-meta"><span class="status-badge '+statusClass(sc)+'">'+statusText(sc)+'</span>' +
       (dur ? '<span class="duration">'+dur+'</span>' : '') +
       (replaced > 0 ? '<span class="replaced-badge">'+replaced+'↺</span>' : '') + '</span>' +
-      '<span class="req-host">'+esc(tx.host||'')+'</span>' +
+      '<span class="req-host">'+esc(tx.host||'')+
+        (ts ? '<span style="float:right;color:var(--text3)">'+esc(ts)+'</span>' : '')+
+      '</span>' +
       '</div>';
   }).join('');
 
@@ -569,7 +575,7 @@ function renderDetail(tx) {
 
   content.innerHTML = '<div class="detail-header">' +
     '<span class="'+methodClass(m)+' '+m+'" style="font-size:14px">'+esc(m)+'</span>' +
-    '<span class="url">'+esc(tx.url||'')+'</span>' +
+    '<span class="url">'+esc(normalizeUrl(tx.url)||'')+'</span>' +
     '<div class="badges">' +
     (sc ? '<span class="status-badge '+statusClass(sc)+'">'+sc+'</span>' : '') +
     (tx.duration ? '<span class="duration">'+formatDuration(tx.duration)+'</span>' : '') +
@@ -581,8 +587,8 @@ function renderDetail(tx) {
     '<div class="section"><div class="section-title">Request' +
     (tx.requestReplaceCount > 0 ? '<span class="pill">'+tx.requestReplaceCount+' replacement'+(tx.requestReplaceCount!==1?'s':'')+'</span>' : '') + '</div>' +
     '<div class="diff-row">' +
-    diffBox('Original (as sent by browser)', formatReqHead(tx.url, tx.originalRequestHeaders, tx.originalRequestBody)) +
-    diffBox('Modified (sent to upstream)', formatReqHead(tx.modifiedUrl, tx.modifiedRequestHeaders, tx.modifiedRequestBody)) +
+    diffBox('Original (as sent by browser)', formatReqHead(m, tx.url, tx.originalRequestHeaders, tx.originalRequestBody)) +
+    diffBox('Modified (sent to upstream)', formatReqHead(m, tx.modifiedUrl, tx.modifiedRequestHeaders, tx.modifiedRequestBody)) +
     '</div></div>' +
 
     /* Response diff */
@@ -614,11 +620,22 @@ function replacementsTable(pairs) {
   return '<table class="replacements-table"><thead><tr><th>Original (upstream)</th><th></th><th>Alias (client sees)</th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
 }
 
-function formatReqHead(url, headers, body) {
+function formatReqHead(method, url, headers, body) {
   let out = '';
-  if (url) out += url + '\n\n';
+  if (url) {
+    try {
+      const u = new URL(url);
+      // Show a standard HTTP request-line: METHOD path?query HTTP/1.1
+      out += (method || '?') + ' ' + (u.pathname + u.search || '/') + ' HTTP/1.1\n';
+      out += 'Host: ' + u.host + '\n';
+    } catch {
+      out += url + '\n';
+    }
+  }
   if (headers) {
     Object.entries(headers).forEach(([k,vals]) => {
+      // Skip Host header — already shown above from the URL.
+      if (k.toLowerCase() === 'host') return;
       (Array.isArray(vals)?vals:[vals]).forEach(v => { out += k+': '+v+'\n'; });
     });
   }
@@ -646,8 +663,26 @@ document.getElementById('method-filter').addEventListener('change', e => { filte
 function esc(s) {
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+// normalizeUrl converts internal /__sd__/<host>/<path> routing URLs back to
+// the real upstream URL for display purposes.
+function normalizeUrl(url) {
+  if (!url) return url;
+  try {
+    const u = new URL(url);
+    const sdPrefix = '/__sd__/';
+    if (u.pathname.startsWith(sdPrefix)) {
+      const rest = u.pathname.slice(sdPrefix.length);
+      const slash = rest.indexOf('/');
+      const subHost = slash >= 0 ? rest.slice(0, slash) : rest;
+      const subPath = slash >= 0 ? rest.slice(slash) : '/';
+      return u.protocol + '//' + subHost + subPath + u.search;
+    }
+  } catch {}
+  return url;
+}
 function urlPath(u) {
-  try { return new URL(u).pathname || u; } catch { return u || ''; }
+  const norm = normalizeUrl(u);
+  try { return new URL(norm).pathname || norm; } catch { return norm || ''; }
 }
 function fmt(n) {
   if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
