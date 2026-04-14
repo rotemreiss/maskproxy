@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -15,6 +16,9 @@ import (
 	"time"
 	"unicode/utf8"
 )
+
+// version is the current release version, shown in the startup banner.
+const version = "1.5.0"
 
 const usage = `maskproxy — a transparent rewriting reverse proxy
 
@@ -88,6 +92,14 @@ Options:
   -port         <n>        Local port to listen on (default: 8080).
   -listen       <addr>     Local listen address (default: 0.0.0.0).
                            Use "127.0.0.1" to restrict to loopback only.
+  -ui-port      <n>        Port for the built-in traffic inspection web UI
+                           (default: 4040). Set to 0 to disable the UI.
+                           Open http://localhost:<n> to view live traffic,
+                           headers, body diffs, and proxy config.
+  -no-ui                   Disable the built-in traffic inspection UI entirely.
+                           Equivalent to -ui-port 0 but more explicit.
+                           Use this when you don't need the UI and want to avoid
+                           binding an extra port.
 
 Examples:
   # Proxy localhost:8080 → https://ctf.io, rewriting ctf↔acme and ctfd↔foo
@@ -161,6 +173,7 @@ func main() {
 	drain := flag.Duration("drain", 15*time.Second, "Grace period for in-flight requests on SIGINT/SIGTERM")
 	maxBody := flag.Int64("max-body", 50, "Maximum response/request body size to buffer for rewriting, in MiB (0 = default 50 MiB)")
 	uiPort := flag.Int("ui-port", 4040, "Port for the traffic inspection UI (0 to disable)")
+	noUI := flag.Bool("no-ui", false, "Disable the built-in traffic inspection UI (equivalent to -ui-port 0)")
 	var headers headerFlag
 	flag.Var(&headers, "header", `Add a header to every upstream request (repeatable). Format: "Name: Value". Example: -header "X-Author: Rotem"`)
 	var ignoreHosts ignoreHostFlag
@@ -295,30 +308,28 @@ func main() {
 
 	proxy := NewReverseProxy(*target, scheme, rep, *skipVerify, pAddr, *exactDomain, *timeout, logger, extraHeaders, ignoredHostsMap, maxBodyBytes, alsoProxyDomains, trafficStore)
 
+	// addr is the network address the main proxy server binds to.
 	addr := fmt.Sprintf("%s:%d", *listen, *port)
-	logger.Printf("maskproxy listening on http://%s", addr)
-	logger.Printf("  → upstream: %s://%s", scheme, *target)
-	if rep.HasPairs() {
-		logger.Printf("  → replacements: %s", combinedSpec)
-		if *cs {
-			logger.Printf("  → replacement mode: case-sensitive (-cs)")
-		}
+
+	// Determine the UI URL (or empty string if disabled).
+	// -no-ui overrides -ui-port; either disables the UI.
+	uiEnabled := *uiPort > 0 && !*noUI
+	uiAddr := ""
+	if uiEnabled {
+		uiAddr = fmt.Sprintf("%s:%d", *listen, *uiPort)
 	}
-	if len(extraHeaders) > 0 {
-		for _, h := range extraHeaders {
-			// Redact values for well-known sensitive header names so that tokens
-			// don't appear in log files when -log is active.
-			val := h.value
-			nameLower := strings.ToLower(h.name)
-			if nameLower == "authorization" || nameLower == "cookie" || strings.Contains(nameLower, "token") || strings.Contains(nameLower, "secret") || strings.Contains(nameLower, "key") {
-				val = "<redacted>"
-			}
-			logger.Printf("  → extra header: %s: %s", h.name, val)
+
+	// Build the config rows for the startup banner: only include rows that
+	// apply to this invocation (keep the banner clean for simple cases).
+	var configRows [][2]string
+	if rep.HasPairs() {
+		val := combinedSpec
+		if *cs {
+			val += "  (case-sensitive)"
 		}
+		configRows = append(configRows, [2]string{"Replace", val})
 	}
 	if len(ignoredHostsMap) > 0 {
-		// Collect and sort for deterministic output.
-		// Dot-prefixed keys are wildcard entries — restore "*.domain" display form.
 		sorted := make([]string, 0, len(ignoredHostsMap))
 		for h := range ignoredHostsMap {
 			if strings.HasPrefix(h, ".") {
@@ -328,45 +339,65 @@ func main() {
 			}
 		}
 		sort.Strings(sorted)
-		logger.Printf("  → ignored hosts (no rewriting): %s", strings.Join(sorted, ", "))
+		configRows = append(configRows, [2]string{"Ignored", strings.Join(sorted, ", ")})
 	}
 	if len(alsoProxyDomains) > 0 {
-		logger.Printf("  → also-proxy domains (routed via /__sd__/): %s", strings.Join(alsoProxyDomains, ", "))
+		configRows = append(configRows, [2]string{"Also-proxy", strings.Join(alsoProxyDomains, ", ")})
+	}
+	// Collect notable flags into a single "Flags" row so they don't clutter
+	// the banner individually — only show when at least one is set.
+	var flags []string
+	if *skipVerify {
+		flags = append(flags, "-skip-verify")
 	}
 	if *exactDomain {
-		logger.Printf("  → subdomain masking: disabled (-exact-domain)")
-	} else {
-		root := computeRootDomain(*target)
-		if root != *target {
-			logger.Printf("  → subdomain masking: *.%s → proxy", root)
-		} else {
-			logger.Printf("  → subdomain masking: *.%s → proxy", *target)
-		}
-	}
-	if *timeout > 0 {
-		logger.Printf("  → upstream timeout: %s", *timeout)
+		flags = append(flags, "-exact-domain")
 	}
 	if *verbose {
-		logger.Printf("  → verbose logging enabled")
+		flags = append(flags, "-verbose")
 	}
 	if *wsNoLog {
-		logger.Printf("  → WebSocket frame logging: disabled (-ws-no-log)")
+		flags = append(flags, "-ws-no-log")
 	}
-	if *logFile != "" {
-		logger.Printf("  → log file: %s", *logFile)
+	if len(flags) > 0 {
+		configRows = append(configRows, [2]string{"Flags", strings.Join(flags, "  ")})
 	}
+
+	// Display URL shown in the banner: substitute 0.0.0.0/:: with "localhost"
+	// so users see a clickable URL, not an unroutable bind address.
+	displayHost := *listen
+	if displayHost == "0.0.0.0" || displayHost == "::" || displayHost == "" {
+		displayHost = "localhost"
+	}
+
+	proxyDisplayURL := fmt.Sprintf("http://%s:%d", displayHost, *port)
+	targetDisplayURL := fmt.Sprintf("%s://%s", scheme, *target)
+	uiDisplayURL := ""
+	if uiEnabled {
+		uiDisplayURL = fmt.Sprintf("http://%s:%d", displayHost, *uiPort)
+	}
+
+	printBanner(os.Stderr, proxyDisplayURL, targetDisplayURL, uiDisplayURL, configRows)
+
+	// Write a single compact machine-readable line to the logger so that
+	// -log file consumers get the essential startup info in their log.
+	logger.Printf("maskproxy v%s started  proxy=%s  target=%s  ui=%s",
+		version, proxyDisplayURL, targetDisplayURL, func() string {
+			if uiEnabled {
+				return uiDisplayURL
+			}
+			return "disabled"
+		}())
 
 	// Start the UI inspection server on a separate port.
 	// It binds to the same listen address as the main proxy (respects -listen flag).
-	if *uiPort > 0 {
-		uiAddr := fmt.Sprintf("%s:%d", *listen, *uiPort)
+	if uiEnabled {
 		uiSrv := NewUIServer(trafficStore, uiAddr)
 		go func() {
 			if err := uiSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				logger.Printf("maskproxy: UI server error: %v", err)
 			}
 		}()
-		logger.Printf("  → UI:  http://%s:%d", *listen, *uiPort)
 	}
 
 	// Use http.Server instead of http.ListenAndServe so we can call Shutdown.
@@ -573,4 +604,104 @@ func loadReplaceFile(path string) (string, error) {
 		return "", fmt.Errorf("reading %q: %w", path, err)
 	}
 	return strings.Join(pairs, ","), nil
+}
+
+// printBanner writes a framed startup banner to w, similar to ngrok's output.
+//
+// The banner has three sections separated by horizontal dividers:
+//  1. Title row:   "maskproxy" left-aligned, version right-aligned
+//  2. URL rows:    Proxy, Target, and (optionally) UI
+//  3. Config rows: only printed when configRows is non-empty (replacements,
+//     ignored hosts, also-proxy domains, active flags)
+//
+// Example output:
+//
+//╔══════════════════════════════════════════════════════╗
+//║  maskproxy                                  v1.5.0  ║
+//╠══════════════════════════════════════════════════════╣
+//║  Proxy    http://localhost:8080                      ║
+//║  Target   https://copilot.microsoft.com              ║
+//║  UI       http://localhost:4040                      ║
+//╠══════════════════════════════════════════════════════╣
+//║  Replace  microsoft → msctf                         ║
+//║  Ignored  login.microsoftonline.com                  ║
+//╚══════════════════════════════════════════════════════╝
+//
+// uiURL may be empty string when the UI is disabled; the UI row is omitted.
+// configRows is [][2]string where [0] is the label and [1] is the value.
+func printBanner(w io.Writer, proxyURL, targetURL, uiURL string, configRows [][2]string) {
+const labelW = 10 // label column width (right-padded with spaces)
+const lpad = 2    // spaces between ║ and content on the left
+const rpad = 2    // spaces between content and ║ on the right
+
+// fmtRow formats a "label  value" string for width measurement.
+fmtRow := func(label, value string) string {
+return fmt.Sprintf("%-*s  %s", labelW, label, value)
+}
+
+// Determine the URL rows (only include UI row when UI is enabled).
+urlRows := [][2]string{
+{"Proxy", proxyURL},
+{"Target", targetURL},
+}
+if uiURL != "" {
+urlRows = append(urlRows, [2]string{"UI", uiURL})
+}
+
+// Compute maxContent: the widest content string across all rows.
+// The title row is the minimum: "maskproxy  v<version>" with at least 2 gap.
+titleL := "maskproxy"
+titleR := "v" + version
+maxContent := len(titleL) + 2 + len(titleR)
+for _, r := range urlRows {
+if n := len(fmtRow(r[0], r[1])); n > maxContent {
+maxContent = n
+}
+}
+for _, r := range configRows {
+if n := len(fmtRow(r[0], r[1])); n > maxContent {
+maxContent = n
+}
+}
+
+// innerW is the total width between the box-drawing wall characters.
+// It equals lpad + maxContent + rpad.
+innerW := lpad + maxContent + rpad
+
+// line returns a full box row with ║ walls and the content left-aligned,
+// right-padded to fill exactly innerW chars between the walls.
+line := func(content string) string {
+// "║" + " "*lpad + content + " "*(innerW-lpad-len(content)) + "║"
+// The right-side padding fills innerW-lpad-len(content) chars; the rpad
+// minimum is always satisfied because len(content) <= maxContent and
+// innerW = lpad + maxContent + rpad.
+rightFill := innerW - lpad - len(content)
+return "║" + strings.Repeat(" ", lpad) + content + strings.Repeat(" ", rightFill) + "║"
+}
+
+// hline returns a horizontal divider with the given corner/junction chars.
+hline := func(left, right string) string {
+return left + strings.Repeat("═", innerW) + right
+}
+
+// titleLine builds the title row with "maskproxy" left and "vX.Y.Z" right.
+titleLine := func() string {
+gap := maxContent - len(titleL) - len(titleR)
+return line(titleL + strings.Repeat(" ", gap) + titleR)
+}
+
+// — Print the banner —
+fmt.Fprintln(w, hline("╔", "╗"))
+fmt.Fprintln(w, titleLine())
+fmt.Fprintln(w, hline("╠", "╣"))
+for _, r := range urlRows {
+fmt.Fprintln(w, line(fmtRow(r[0], r[1])))
+}
+if len(configRows) > 0 {
+fmt.Fprintln(w, hline("╠", "╣"))
+for _, r := range configRows {
+fmt.Fprintln(w, line(fmtRow(r[0], r[1])))
+}
+}
+fmt.Fprintln(w, hline("╚", "╝"))
 }

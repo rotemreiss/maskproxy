@@ -81,6 +81,7 @@ maskproxy -target <host> [options]
 | Flag | Description |
 |------|-------------|
 | `-ui-port <n>` | Port for the built-in traffic inspection web UI (default: `4040`). Set to `0` to disable. |
+| `-no-ui` | Disable the UI entirely. Equivalent to `-ui-port 0` but more explicit. Use when you don't need the UI and want to avoid binding an extra port. |
 
 When enabled, open `http://localhost:4040` (or whatever `-listen`/`-ui-port` you chose) in a browser to see:
 
@@ -90,6 +91,27 @@ When enabled, open `http://localhost:4040` (or whatever `-listen`/`-ui-port` you
 - Original and modified request/response headers
 - Aggregated statistics (request count by status class, replacement counts, active hosts)
 - Proxy configuration summary (target, replacement pairs, ignored hosts)
+- Any alias stability warnings detected at runtime
+
+### Startup banner
+
+On launch, maskproxy prints a framed summary to stderr (similar to ngrok), making the proxy and UI URLs immediately visible:
+
+```
+╔═════════════════════════════════════════════╗
+║  maskproxy                          v1.5.0  ║
+╠═════════════════════════════════════════════╣
+║  Proxy       http://localhost:8080          ║
+║  Target      https://copilot.microsoft.com  ║
+║  UI          http://localhost:4040          ║
+╠═════════════════════════════════════════════╣
+║  Replace     microsoft:msctf                ║
+║  Ignored     login.microsoftonline.com      ║
+║  Flags       -skip-verify                   ║
+╚═════════════════════════════════════════════╝
+```
+
+The config section (second divider block) is omitted when no replacements, ignored hosts, or notable flags are active, keeping simple invocations clean.
 
 ## Examples
 

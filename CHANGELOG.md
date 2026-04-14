@@ -2,7 +2,24 @@
 
 All notable changes to maskproxy are documented here.
 
-## [v1.5.0] — 2026-04-14
+## [v1.6.0] — 2026-04-14
+
+### New Features
+- **`-no-ui` flag** — explicitly disables the built-in traffic inspection UI without needing to remember `-ui-port 0`. Use when you don't need the UI and want to avoid binding an extra port.
+- **ngrok-style startup banner** — replaces the flat log-line dump with a framed summary printed to stderr. The banner shows the Proxy URL, Target URL, and UI URL (or omits it when disabled) at a glance, followed by an optional config section (replacements, ignored hosts, also-proxy domains, active flags). The config section is omitted entirely for simple invocations so the output stays clean.
+
+### Improvements
+- `0.0.0.0` is substituted with `localhost` in the banner URLs so the links are immediately clickable.
+- A single compact machine-readable log line is still written via the logger (for `-log` file consumers): `maskproxy v1.5.0 started  proxy=…  target=…  ui=…`
+- Added `version` constant (`"1.5.0"`) to the codebase; version appears in the banner and the log line.
+
+### Documentation
+- Updated README with `-no-ui` flag, startup banner section (with example output), and updated traffic inspection UI section.
+- Updated `-port`/`-listen` usage string with new `-ui-port`/`-no-ui` entries.
+
+---
+
+
 
 ### New Features
 - **Alias minimum-length enforcement** — the proxy now refuses to start if any alias is shorter than 5 Unicode characters. Short aliases like `ing`, `com`, `api` appear as substrings in countless URLs and request bodies; allowing them would silently corrupt unrelated traffic (e.g. `-replace microsoft:ing` would turn `/loading.js` into `/loaMicrosoftg.js`). The startup error message includes a concrete corruption example and the offending alias.
