@@ -4552,3 +4552,37 @@ if resp.StatusCode != http.StatusSwitchingProtocols {
 t.Errorf("expected 101, got %d", resp.StatusCode)
 }
 }
+
+// TestFollowTargetRedirectProtocolRelativeLocation verifies the locURL.Scheme==""
+// branch. A protocol-relative Location like "//host/path" has Host≠"" but no
+// scheme, so the transport must fill in the scheme from t.scheme.
+func TestFollowTargetRedirectProtocolRelativeLocation(t *testing.T) {
+var step2Hit bool
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+if r.URL.Path == "/" {
+// Protocol-relative Location — scheme is absent, host is present.
+// url.Parse("//host/path") → {Scheme:"", Host:"host", Path:"/path"}
+w.Header().Set("Location", "//"+r.Host+"/step2")
+w.WriteHeader(http.StatusFound)
+return
+}
+step2Hit = true
+fmt.Fprint(w, "ok")
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("", false)
+proxy := NewReverseProxy(host, "http", rep, false, "localhost:9810", true, 0, newDiscardLogger(), nil, nil, 0, nil)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+resp, err := ps.Client().Get(ps.URL + "/")
+if err != nil {
+t.Fatal(err)
+}
+resp.Body.Close()
+if !step2Hit {
+t.Error("protocol-relative redirect was not followed")
+}
+}
