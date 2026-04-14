@@ -10,9 +10,19 @@ import (
 )
 
 // NewUIServer creates an HTTP server that serves the traffic inspection UI.
-// addr is the listen address (e.g. "0.0.0.0:4040").
+// addr is the listen address, e.g. "127.0.0.1:4040". All endpoints are
+// intentionally same-origin only (no CORS headers) since the HTML page is
+// served from the same host:port as the API, and the UI contains sensitive
+// proxy traffic data (auth headers, cookies, request/response bodies).
 func NewUIServer(store *TrafficStore, addr string) *http.Server {
 	mux := http.NewServeMux()
+
+	// jsonAPI is a helper that sets JSON headers and handles OPTIONS preflight.
+	// No CORS is set: the UI page is served from the same origin as the API.
+	jsonAPI := func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+	}
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -20,13 +30,14 @@ func NewUIServer(store *TrafficStore, addr string) *http.Server {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		fmt.Fprint(w, uiHTML)
 	})
 
 	// GET /api/transactions → JSON array of all transactions (newest first)
 	mux.HandleFunc("/api/transactions", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		jsonAPI(w)
 		txns := store.All()
 		// Reverse so newest is first.
 		for i, j := 0, len(txns)-1; i < j; i, j = i+1, j-1 {
@@ -35,10 +46,9 @@ func NewUIServer(store *TrafficStore, addr string) *http.Server {
 		json.NewEncoder(w).Encode(txns)
 	})
 
-	// GET /api/transactions/:id → single transaction JSON
+	// GET /api/transaction/:id → single transaction JSON
 	mux.HandleFunc("/api/transaction/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		jsonAPI(w)
 		idStr := strings.TrimPrefix(r.URL.Path, "/api/transaction/")
 		id, err := strconv.ParseUint(idStr, 10, 64)
 		if err != nil {
@@ -55,15 +65,13 @@ func NewUIServer(store *TrafficStore, addr string) *http.Server {
 
 	// GET /api/stats → aggregated statistics
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		jsonAPI(w)
 		json.NewEncoder(w).Encode(store.ComputeStats())
 	})
 
 	// GET /api/config → proxy configuration (target, replacements, ignored hosts)
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		jsonAPI(w)
 		type config struct {
 			Target       string            `json:"target"`
 			Replacements []ReplacementPair `json:"replacements"`
@@ -78,8 +86,7 @@ func NewUIServer(store *TrafficStore, addr string) *http.Server {
 
 	// GET /api/hosts → active host counts
 	mux.HandleFunc("/api/hosts", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		jsonAPI(w)
 		json.NewEncoder(w).Encode(store.ActiveHosts())
 	})
 
@@ -88,7 +95,6 @@ func NewUIServer(store *TrafficStore, addr string) *http.Server {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 
 		flusher, ok := w.(http.Flusher)
 		if !ok {
