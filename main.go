@@ -210,6 +210,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Enforce a minimum alias length of 5 characters.
+	// Short aliases (e.g. "ing", "com", "api") are extremely common substrings
+	// that appear in URLs, headers, and request bodies.  When the proxy rewrites
+	// outbound requests (alias→original) such a short alias will corrupt
+	// unrelated content: "loading.js" → "loaMicrosoftg.js".
+	// This check runs at startup so the proxy never silently corrupts traffic.
+	const minAliasLen = 5
+	for _, p := range rep.Pairs() {
+		if len(p.Alias) < minAliasLen {
+			fmt.Fprintf(os.Stderr,
+				"error: alias %q (for %q) is only %d character(s) long.\n"+
+					"  Aliases shorter than %d characters are too common to be unique —\n"+
+					"  they will corrupt unrelated URLs and request bodies by replacing\n"+
+					"  every occurrence of %q with %q.\n"+
+					"  Example: /loading.js would become /lo%sg.js\n"+
+					"  Please choose a more unique alias (at least %d characters).\n",
+				p.Alias, p.Original, len(p.Alias), minAliasLen,
+				p.Alias, p.Original, p.Original, minAliasLen,
+			)
+			os.Exit(1)
+		}
+	}
+
 	// Parse and validate -header flags into headerPair structs.
 	// Parsing happens once here (not per-request) for efficiency.
 	extraHeaders, err := parseHeaders(headers)

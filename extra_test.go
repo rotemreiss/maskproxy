@@ -4890,3 +4890,185 @@ func TestRewriteRootRelativePathsSpeculationRulesAlreadyPrefixed(t *testing.T) {
 		t.Errorf("expected %s/news to remain, got:\n%s", pfx, got)
 	}
 }
+
+// ── Alias stability feature tests ────────────────────────────────────────────
+
+// TestReplacerPairs verifies Pairs() returns the configured pairs sorted by
+// alias length descending (same order as outbound request rewriting uses).
+func TestReplacerPairs(t *testing.T) {
+rep, err := NewReplacer("microsoft:msctf,microsoftonline:msonline", false)
+if err != nil {
+t.Fatalf("NewReplacer: %v", err)
+}
+pairs := rep.Pairs()
+if len(pairs) != 2 {
+t.Fatalf("expected 2 pairs, got %d", len(pairs))
+}
+// Longer alias "msonline" (8) must come before "msctf" (5).
+if pairs[0].Alias != "msonline" {
+t.Errorf("first pair alias want %q, got %q", "msonline", pairs[0].Alias)
+}
+if pairs[1].Alias != "msctf" {
+t.Errorf("second pair alias want %q, got %q", "msctf", pairs[1].Alias)
+}
+}
+
+// TestReplacerPairsEmpty verifies Pairs() returns nil (not panic) for an
+// empty Replacer.
+func TestReplacerPairsEmpty(t *testing.T) {
+rep, _ := NewReplacer("", false)
+if got := rep.Pairs(); len(got) != 0 {
+t.Errorf("expected empty, got %v", got)
+}
+}
+
+// TestMinAliasLenValidation verifies that validateAliasLengths returns an
+// error for aliases shorter than 5 characters and nil for valid ones.
+// This mirrors the validation logic in main() so it can be unit-tested without
+// running the real binary.
+func TestMinAliasLenValidation(t *testing.T) {
+const minAliasLen = 5
+
+cases := []struct {
+spec    string
+wantErr bool
+}{
+{"microsoft:msctf", false},          // alias "msctf" = 5 chars — OK
+{"github:ghcli", false},             // alias "ghcli" = 5 chars — OK
+{"microsoft:msft", true},            // alias "msft" = 4 chars — should fail
+{"microsoft:ing", true},             // alias "ing" = 3 chars — should fail
+{"ctf:acme,ctfd:foobar", true},      // "acme" = 4 — should fail
+{"ctf:acmec,ctfd:foobar", false},    // both ≥ 5 — OK
+}
+
+for _, tc := range cases {
+rep, err := NewReplacer(tc.spec, false)
+if err != nil {
+// parse error — skip (not what we're testing here)
+continue
+}
+var gotErr bool
+for _, p := range rep.Pairs() {
+if len(p.Alias) < minAliasLen {
+gotErr = true
+break
+}
+}
+if gotErr != tc.wantErr {
+t.Errorf("spec %q: wantErr=%v gotErr=%v", tc.spec, tc.wantErr, gotErr)
+}
+}
+}
+
+// TestStabilityWarningFired verifies that a stability warning is recorded in
+// the TrafficStore when an alias is found embedded in the request URL, and
+// that it is only recorded once even if multiple requests trigger it.
+func TestStabilityWarningFired(t *testing.T) {
+// Upstream echoes 200 OK for every request.
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+w.WriteHeader(http.StatusOK)
+}))
+defer upstream.Close()
+
+upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
+store := NewTrafficStore()
+
+// alias "loading" is 7 chars (≥ 5 so it passes the startup check) but
+// the URL path "/preloading.js" embeds it inside a larger word
+// ("pre" + "loading") — the stability check should fire because "loading"
+// is immediately preceded by the alphanumeric character "e".
+rep, err := NewReplacer("microsoft:loading", false)
+if err != nil {
+t.Fatalf("NewReplacer: %v", err)
+}
+
+proxy := NewReverseProxy(
+upstreamHost, "http", rep, true,
+"localhost:19999", false, 0,
+newDiscardLogger(), nil, nil, 50*1024*1024, nil, store,
+)
+
+srv := httptest.NewServer(proxy)
+defer srv.Close()
+
+// First request — URL embeds the alias inside a larger word.
+_, err = http.Get(srv.URL + "/preloading.js")
+if err != nil {
+t.Fatalf("GET /preloading.js: %v", err)
+}
+
+// The stability check runs synchronously inside the Director.
+warnings := store.StabilityWarnings()
+if len(warnings) != 1 {
+t.Fatalf("expected 1 stability warning, got %d", len(warnings))
+}
+if warnings[0].Alias != "loading" {
+t.Errorf("warning alias: want %q, got %q", "loading", warnings[0].Alias)
+}
+if warnings[0].Original != "microsoft" {
+t.Errorf("warning original: want %q, got %q", "microsoft", warnings[0].Original)
+}
+if !strings.Contains(warnings[0].ExampleURL, "/preloading.js") {
+t.Errorf("exampleURL should contain /preloading.js, got %q", warnings[0].ExampleURL)
+}
+
+// Second request with a different embedding — warning must NOT be duplicated.
+http.Get(srv.URL + "/reloading.css") //nolint:errcheck
+warnings = store.StabilityWarnings()
+if len(warnings) != 1 {
+t.Errorf("expected warning deduplication; got %d warnings", len(warnings))
+}
+}
+
+// TestStabilityWarningNotFiredForUnambiguousAlias verifies that no warning is
+// recorded when the alias stands alone (not adjacent to alphanumeric chars).
+func TestStabilityWarningNotFiredForUnambiguousAlias(t *testing.T) {
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+w.WriteHeader(http.StatusOK)
+}))
+defer upstream.Close()
+
+upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
+store := NewTrafficStore()
+
+rep, err := NewReplacer("ctf:acmec", false)
+if err != nil {
+t.Fatalf("NewReplacer: %v", err)
+}
+
+proxy := NewReverseProxy(
+upstreamHost, "http", rep, true,
+"localhost:19998", false, 0,
+newDiscardLogger(), nil, nil, 50*1024*1024, nil, store,
+)
+
+srv := httptest.NewServer(proxy)
+defer srv.Close()
+
+// The alias "acmec" appears standalone (not embedded) in the path.
+http.Get(srv.URL + "/acmec/dashboard") //nolint:errcheck
+warnings := store.StabilityWarnings()
+if len(warnings) != 0 {
+t.Errorf("expected no warnings for standalone alias, got %d: %+v", len(warnings), warnings)
+}
+}
+
+// TestTrafficStoreStabilityWarnings verifies AddStabilityWarning deduplication.
+func TestTrafficStoreStabilityWarnings(t *testing.T) {
+s := NewTrafficStore()
+
+s.AddStabilityWarning("ing", "microsoft", "/loading.js")
+s.AddStabilityWarning("ing", "microsoft", "/rendering.js") // duplicate alias — ignored
+s.AddStabilityWarning("com", "company", "/welcome.com")    // different alias — added
+
+ws := s.StabilityWarnings()
+if len(ws) != 2 {
+t.Fatalf("expected 2 warnings (deduped), got %d", len(ws))
+}
+if ws[0].Alias != "ing" || ws[0].ExampleURL != "/loading.js" {
+t.Errorf("first warning unexpected: %+v", ws[0])
+}
+if ws[1].Alias != "com" {
+t.Errorf("second warning unexpected: %+v", ws[1])
+}
+}

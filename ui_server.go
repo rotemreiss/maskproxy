@@ -69,18 +69,21 @@ func NewUIServer(store *TrafficStore, addr string) *http.Server {
 		json.NewEncoder(w).Encode(store.ComputeStats())
 	})
 
-	// GET /api/config → proxy configuration (target, replacements, ignored hosts)
+	// GET /api/config → proxy configuration (target, replacements, ignored hosts,
+	// and any alias stability warnings detected at runtime).
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		jsonAPI(w)
 		type config struct {
-			Target       string            `json:"target"`
-			Replacements []ReplacementPair `json:"replacements"`
-			IgnoredHosts []string          `json:"ignoredHosts"`
+			Target             string             `json:"target"`
+			Replacements       []ReplacementPair  `json:"replacements"`
+			IgnoredHosts       []string           `json:"ignoredHosts"`
+			StabilityWarnings  []StabilityWarning `json:"stabilityWarnings"`
 		}
 		json.NewEncoder(w).Encode(config{
-			Target:       store.Target,
-			Replacements: store.Replacements,
-			IgnoredHosts: store.IgnoredHosts,
+			Target:            store.Target,
+			Replacements:      store.Replacements,
+			IgnoredHosts:      store.IgnoredHosts,
+			StabilityWarnings: store.StabilityWarnings(),
 		})
 	})
 

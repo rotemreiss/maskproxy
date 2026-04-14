@@ -165,6 +165,15 @@ func (r *Replacer) HasPairs() bool {
 	return len(r.forResponse) > 0
 }
 
+// Pairs returns a copy of the configured pairs, sorted by Alias length
+// descending (same order as the outbound request rewriter uses).
+// The returned slice is a copy; callers may not modify the Replacer through it.
+func (r *Replacer) Pairs() []Pair {
+	out := make([]Pair, len(r.forRequest))
+	copy(out, r.forRequest)
+	return out
+}
+
 // ToOriginalDiff is like ToOriginal but also returns the number of substitutions made.
 func (r *Replacer) ToOriginalDiff(s string) (string, int) {
 	count := 0

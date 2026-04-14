@@ -73,6 +73,20 @@ type TrafficStore struct {
 	// Proxy config (display).
 	Target       string
 	Replacements []ReplacementPair
+
+	// Alias stability warnings detected at runtime (see AddStabilityWarning).
+	warnMu   sync.Mutex
+	warnings []StabilityWarning
+}
+
+// StabilityWarning is recorded the first time an alias string is found
+// embedded inside a larger word in a request URL, indicating that the
+// alias→original rewrite will corrupt unrelated content.
+type StabilityWarning struct {
+	Alias      string    `json:"alias"`
+	Original   string    `json:"original"`
+	ExampleURL string    `json:"exampleUrl"` // the URL that triggered the warning
+	FirstSeen  time.Time `json:"firstSeen"`
 }
 
 // ReplacementPair holds one original↔alias mapping for display in the UI.
@@ -87,6 +101,33 @@ func NewTrafficStore() *TrafficStore {
 		transactions: make([]*Transaction, maxTransactions),
 		activeHosts:  make(map[string]int),
 	}
+}
+
+// AddStabilityWarning appends a warning if no warning for this alias already
+// exists.  Safe for concurrent calls; the first caller wins.
+func (s *TrafficStore) AddStabilityWarning(alias, original, exampleURL string) {
+	s.warnMu.Lock()
+	defer s.warnMu.Unlock()
+	for _, w := range s.warnings {
+		if w.Alias == alias {
+			return // already recorded for this alias
+		}
+	}
+	s.warnings = append(s.warnings, StabilityWarning{
+		Alias:      alias,
+		Original:   original,
+		ExampleURL: exampleURL,
+		FirstSeen:  time.Now(),
+	})
+}
+
+// StabilityWarnings returns a copy of all recorded stability warnings.
+func (s *TrafficStore) StabilityWarnings() []StabilityWarning {
+	s.warnMu.Lock()
+	defer s.warnMu.Unlock()
+	out := make([]StabilityWarning, len(s.warnings))
+	copy(out, s.warnings)
+	return out
 }
 
 // NewTransaction allocates a Transaction with a fresh ID and current timestamp.

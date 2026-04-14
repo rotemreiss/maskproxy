@@ -38,7 +38,7 @@ maskproxy -target <host> [options]
 
 | Flag | Description |
 |------|-------------|
-| `-replace <pairs>` | Comma-separated `original:alias` pairs, e.g. `ctf:acme,ctfd:foo`. |
+| `-replace <pairs>` | Comma-separated `original:alias` pairs, e.g. `ctf:acme,ctfd:foo`. Aliases must be at least **5 characters** long to avoid corrupting unrelated strings in URLs and request bodies. |
 | `-replace-file <path>` | File with one `original:alias` pair per line (`#` comments and blank lines ignored). Combined with `-replace`; CLI pairs win on conflict. |
 | `-ignore-host <hosts>` | Comma-separated upstream hostnames to exclude from all rewriting. Supports wildcard prefix `*.domain.com` to match any subdomain. Traffic still flows through the proxy but bodies and headers are passed through unchanged. Useful to protect hosts whose JS bundles contain strings that must not be touched (e.g. OAuth scope IDs). Repeatable. |
 | `-also-proxy <domains>` | Comma-separated extra domains (not subdomains of `-target`) that should be proxied through `/__sd__/<host>/` rather than fetched directly by the browser. Use when a site loads assets from an entirely different domain that also needs string replacement — e.g. `bbc.com` loads scripts from `bbc.co.uk`. Repeatable. |
@@ -134,6 +134,8 @@ maskproxy -target ctf.io -replace ctf:acme -ui-port 0
 - Pairs are applied **longest-key-first** to prevent partial-match bugs (`ctfd` is always matched before `ctf`).
 - Only **text** content types are rewritten. Binary responses (images, fonts, etc.) pass through unchanged.
 - **gzip/deflate-compressed** responses are transparently decompressed, rewritten, and forwarded as plain text.
+- **Alias length**: aliases must be at least **5 characters** long. Shorter aliases (e.g. `ing`, `com`, `api`) are common substrings that appear in real URLs and headers — the proxy refuses to start with a short alias to prevent silent corruption (e.g. `/loading.js` → `/loaMicrosoftg.js`).
+- **Stability warning**: at runtime, if any alias is found embedded inside a larger alphanumeric word in a request URL, the proxy logs a warning to stderr and records it in the traffic inspection UI. For example, alias `load` would trigger if the URL contains `/preloaded.js`. This is a sign the alias is not unique enough and may corrupt unrelated strings.
 
 ## Design notes
 
