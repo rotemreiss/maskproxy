@@ -1490,7 +1490,7 @@ pa := proxy
 if tc.name == "proxyAddr empty disables rewriting" {
 pa = ""
 }
-got := rewriteCSP(tc.in, target, root, pa)
+got := rewriteCSP(tc.in, target, root, pa, nil)
 if got != tc.want {
 t.Errorf("\n  got  %q\n  want %q", got, tc.want)
 }
@@ -3283,7 +3283,7 @@ desc: "sandbox with flags",
 },
 }
 for _, tc := range cases {
-got := rewriteCSP(tc.in, "example.com", "example.com", "localhost:9090")
+got := rewriteCSP(tc.in, "example.com", "example.com", "localhost:9090", nil)
 if got != tc.want {
 t.Errorf("rewriteCSP(%q) [%s]:\n got  %q\n want %q", tc.in, tc.desc, got, tc.want)
 }
@@ -4672,3 +4672,46 @@ func TestSubdomainExplicitPortURLRewritten(t *testing.T) {
 }
 
 
+
+// TestRewriteCSPAlsoProxyDomains verifies that rewriteCSP rewrites source tokens
+// from also-proxy domains to the proxy address, not just target-domain tokens.
+// This is needed so that when -also-proxy includes a CDN domain (e.g.
+// githubassets.com), scripts/styles from that CDN — now served via /__sd__/ —
+// are still allowed by the CSP.
+func TestRewriteCSPAlsoProxyDomains(t *testing.T) {
+alsoProxy := map[string]bool{
+"githubassets.com": true,
+}
+cases := []struct {
+desc string
+in   string
+want string
+}{
+{
+"CDN script-src rewritten to proxy",
+"script-src github.githubassets.com",
+"script-src localhost:9022",
+},
+{
+"CDN subdomain rewritten",
+"font-src static.githubassets.com",
+"font-src localhost:9022",
+},
+{
+"target domain also rewritten",
+"connect-src github.com api.github.com",
+"connect-src localhost:9022 localhost:9022",
+},
+{
+"keywords unchanged",
+"script-src 'self' 'nonce-abc' github.githubassets.com",
+"script-src 'self' 'nonce-abc' localhost:9022",
+},
+}
+for _, tc := range cases {
+got := rewriteCSP(tc.in, "github.com", "github.com", "localhost:9022", alsoProxy)
+if got != tc.want {
+t.Errorf("[%s]\n got  %q\n want %q", tc.desc, got, tc.want)
+}
+}
+}

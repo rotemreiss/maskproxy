@@ -903,7 +903,7 @@ func rewriteRootRelativePaths(s, subHost string) string {
 // `report-uri` and `report-to` directives are dropped: they would send
 // violation reports to the upstream's collection endpoint, leaking traffic
 // and the real hostname.
-func rewriteCSP(csp, targetHost, rootDomain, proxyAddr string) string {
+func rewriteCSP(csp, targetHost, rootDomain, proxyAddr string, alsoProxyDomains map[string]bool) string {
 	if proxyAddr == "" || csp == "" {
 		return csp
 	}
@@ -986,7 +986,7 @@ func rewriteCSP(csp, targetHost, rootDomain, proxyAddr string) string {
 				hadHash = true
 				continue
 			}
-			rewritten = append(rewritten, rewriteCSPToken(tok, targetLower, rootLower, proxyAddr))
+			rewritten = append(rewritten, rewriteCSPToken(tok, targetLower, rootLower, proxyAddr, alsoProxyDomains))
 		}
 		// If we stripped hashes, inject 'unsafe-inline' so inline scripts/styles
 		// still load. Without it, the directive's source list may become overly
@@ -1023,8 +1023,8 @@ func rewriteCSP(csp, targetHost, rootDomain, proxyAddr string) string {
 }
 
 // rewriteCSPToken rewrites a single CSP source token if it references the
-// proxied target domain or any of its subdomains.
-func rewriteCSPToken(token, targetLower, rootLower, proxyAddr string) string {
+// proxied target domain, any of its subdomains, or any also-proxy domain.
+func rewriteCSPToken(token, targetLower, rootLower, proxyAddr string, alsoProxyDomains map[string]bool) string {
 	// CSP keywords always start with a single-quote — leave them untouched.
 	if strings.HasPrefix(token, "'") {
 		return token
@@ -1059,11 +1059,21 @@ func rewriteCSPToken(token, targetLower, rootLower, proxyAddr string) string {
 		host = hostPort[:i]
 	}
 
-	// Check whether the host belongs to the target domain (exact match or subdomain).
+	// Check whether the host belongs to the target domain (exact match or subdomain)
+	// or to any of the also-proxy domains.
 	isTarget := host == targetLower ||
 		strings.HasSuffix(host, "."+targetLower) ||
 		host == rootLower ||
 		strings.HasSuffix(host, "."+rootLower)
+
+	if !isTarget && len(alsoProxyDomains) > 0 {
+		for extra := range alsoProxyDomains {
+			if host == extra || strings.HasSuffix(host, "."+extra) {
+				isTarget = true
+				break
+			}
+		}
+	}
 
 	if !isTarget {
 		return token
@@ -1641,6 +1651,23 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			*req = *req.WithContext(context.WithValue(req.Context(), clientHostContextKey{}, clientHost))
 		}
 
+		// === UI: create a transaction snapshot before any URL/header mutations ===
+		// tx is nil when store is nil (UI disabled), making all tx checks no-ops.
+		var tx *Transaction
+		var txOrigBody, txModBody string // captured in the body-handling branches
+		var txBodyReplaceCount int
+		if store != nil {
+			tx = store.NewTransaction()
+			tx.Method = req.Method
+			// Reconstruct the full client-visible URL: proxy's own scheme + the Host
+			// header the browser sent (which may contain alias strings) + the raw
+			// request-URI (path + query) before any alias-reversal rewriting.
+			tx.URL = scheme + "://" + clientHost + req.URL.RequestURI()
+			// Snapshot headers before header-rewriting pass so the UI shows exactly
+			// what the browser sent, not what the proxy forwarded upstream.
+			tx.OriginalRequestHeaders = req.Header.Clone()
+		}
+
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		// Set Host header explicitly so the upstream server receives the correct
@@ -1716,6 +1743,13 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			req.URL.RawPath = ""
 		}
 
+		// === UI: record which upstream host this request will be sent to ===
+		// Must happen after subdomain routing overwrites req.Host.
+		if tx != nil {
+			tx.Host = req.Host
+			tx.IsIgnored = ignored.contains(req.Host)
+		}
+
 		// Rewrite request headers in a single pass:
 		//   1. User replacements (alias → original), e.g. /acme/page → /ctf/page
 		//   2. Reverse host masking (proxy addr → upstream host), e.g.
@@ -1764,12 +1798,29 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 				} else {
 					req.Body.Close()
 					rewritten := string(raw)
+					// === UI: capture original body before alias-reversal rewriting ===
+					if tx != nil {
+						if len(raw) <= uiBodyPreview {
+							txOrigBody = rewritten
+						} else {
+							txOrigBody = string(raw[:uiBodyPreview])
+						}
+					}
 					replaceCount := 0
 					if !ignored.contains(outboundHost) {
 						if rep.HasPairs() {
 							rewritten, replaceCount = rep.ToOriginalDiff(rewritten)
 						}
 						rewritten = unmaskRequestString(rewritten, outboundHost, scheme, proxyAddr)
+					}
+					// === UI: capture modified body after rewriting ===
+					if tx != nil {
+						if len(rewritten) <= uiBodyPreview {
+							txModBody = rewritten
+						} else {
+							txModBody = rewritten[:uiBodyPreview]
+						}
+						txBodyReplaceCount = replaceCount
 					}
 					req.Body = io.NopCloser(strings.NewReader(rewritten))
 					req.ContentLength = int64(len(rewritten))
@@ -1857,6 +1908,26 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		req.Header.Del("If-Match")
 		req.Header.Del("If-Unmodified-Since")
 		req.Header.Del("If-Range")
+
+		// === UI: finalise the request snapshot and register it for modifyResponse ===
+		// This runs after all header stripping so ModifiedRequestHeaders reflects
+		// exactly what the proxy forwards upstream.
+		if tx != nil {
+			if tx.Host == "" {
+				// Non-subdomain request: host wasn't set by the routing block above.
+				tx.Host = req.Host
+				tx.IsIgnored = ignored.contains(req.Host)
+			}
+			tx.ModifiedURL = req.URL.Scheme + "://" + req.URL.Host + req.URL.RequestURI()
+			tx.ModifiedRequestHeaders = req.Header.Clone()
+			tx.OriginalRequestBody = txOrigBody
+			tx.ModifiedRequestBody = txModBody
+			tx.RequestReplaceCount = txBodyReplaceCount
+			tx.IsWS = strings.EqualFold(req.Header.Get("Upgrade"), "websocket")
+			// Store in txStore keyed by the request pointer; modifyResponse will
+			// retrieve it via the same pointer to add the response fields.
+			txStore.Store(req, tx)
+		}
 	}
 
 	modifyResponse := func(resp *http.Response) error {
@@ -1979,7 +2050,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// CSP values need token-level parsing (not simple string replacement).
 		for _, cspKey := range []string{"Content-Security-Policy", "Content-Security-Policy-Report-Only"} {
 			for i, v := range resp.Header[cspKey] {
-				resp.Header[cspKey][i] = rewriteCSP(v, targetHost, rootDomain, effectiveProxyAddr)
+				resp.Header[cspKey][i] = rewriteCSP(v, targetHost, rootDomain, effectiveProxyAddr, alsoProxyDomains)
 			}
 		}
 
@@ -2060,30 +2131,22 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		if !isTextContent(contentType) {
 			// Log before returning — no body snapshot for binary content.
 			logger.LogResponse(resp, "", start, 0)
+			saveTx("", "", 0)
 			return nil
 		}
 
-		// HEAD, 204 No Content, and 304 Not Modified responses have no body.
-		// The upstream may still send Content-Encoding: gzip (describing what the
-		// body *would* have been), so we must skip gzip decoding here to avoid
-		// "failed to decode gzip response: EOF" noise in the logs.
 		noBody := resp.Request.Method == http.MethodHead ||
 			resp.StatusCode == http.StatusNoContent ||
 			resp.StatusCode == http.StatusNotModified
 		if noBody {
 			logger.LogResponse(resp, "", start, 0)
+			saveTx("", "", 0)
 			return nil
 		}
 
-		// Server-Sent Events (text/event-stream) are long-lived streaming
-		// responses that must not be fully buffered — io.ReadAll would block
-		// until the stream closes.  FlushInterval=-1 on the ReverseProxy
-		// handles progressive flushing; we skip body rewriting here so the
-		// client receives each "data: …\n\n" event in real time.
-		// Header rewriting above already ran, so host masking in headers is
-		// still applied even for SSE responses.
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0])), "text/event-stream") {
 			logger.LogResponse(resp, "", start, 0)
+			saveTx("", "", 0)
 			return nil
 		}
 
