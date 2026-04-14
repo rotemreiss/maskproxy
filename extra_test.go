@@ -27,6 +27,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -4002,5 +4004,209 @@ req, _ := http.NewRequest("GET", "http://example.com/ws", nil)
 lg.LogRequest(req, "", true, 0)
 if !strings.Contains(buf.String(), "WS↑") {
 t.Errorf("expected WS method; got: %q", buf.String())
+}
+}
+
+// ─── logger helpers ───────────────────────────────────────────────────────────
+
+// TestNewLoggerToFile verifies that NewLogger writes to a file when logPath
+// is non-empty, and that the closer properly closes it.
+func TestNewLoggerToFile(t *testing.T) {
+tmp := t.TempDir()
+path := filepath.Join(tmp, "proxy.log")
+lg, closer, err := NewLogger(false, false, path)
+if err != nil {
+t.Fatalf("NewLogger: %v", err)
+}
+defer closer()
+lg.Printf("hello logger")
+closer() // flush/close
+
+data, err := os.ReadFile(path)
+if err != nil {
+t.Fatalf("ReadFile: %v", err)
+}
+if !strings.Contains(string(data), "hello logger") {
+t.Errorf("log file missing expected content; got: %q", string(data))
+}
+}
+
+// TestNewLoggerBadPath verifies that NewLogger returns an error for an
+// unwritable log path.
+func TestNewLoggerBadPath(t *testing.T) {
+_, _, err := NewLogger(false, false, "/nonexistent/dir/proxy.log")
+if err == nil {
+t.Error("expected error for bad logPath, got nil")
+}
+}
+
+// TestHumanBytes verifies humanBytes for various magnitudes.
+func TestHumanBytes(t *testing.T) {
+tests := []struct {
+n    int64
+want string
+}{
+{0, "0 B"},
+{512, "512 B"},
+{1023, "1023 B"},
+{1024, "1.0 KB"},
+{1536, "1.5 KB"},
+{1048576, "1.0 MB"},
+{1073741824, "1.0 GB"},
+}
+for _, tc := range tests {
+got := humanBytes(tc.n)
+if got != tc.want {
+t.Errorf("humanBytes(%d) = %q; want %q", tc.n, got, tc.want)
+}
+}
+}
+
+// ─── main.go helpers ──────────────────────────────────────────────────────────
+
+// TestProxyAddr verifies proxyAddr normalises listener addresses.
+func TestProxyAddr(t *testing.T) {
+tests := []struct {
+listen string
+port   int
+want   string
+}{
+{"0.0.0.0", 8080, "localhost:8080"},
+{"::", 8080, "localhost:8080"},
+{"", 9000, "localhost:9000"},
+{"192.168.1.1", 9001, "192.168.1.1:9001"},
+}
+for _, tc := range tests {
+got := proxyAddr(tc.listen, tc.port)
+if got != tc.want {
+t.Errorf("proxyAddr(%q, %d) = %q; want %q", tc.listen, tc.port, got, tc.want)
+}
+}
+}
+
+// TestParseHeadersValid verifies that well-formed header strings are accepted.
+func TestParseHeadersValid(t *testing.T) {
+pairs, err := parseHeaders([]string{"X-Custom: value", "Authorization: Bearer tok"})
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+if len(pairs) != 2 {
+t.Fatalf("expected 2 pairs, got %d", len(pairs))
+}
+if pairs[0].name != "X-Custom" || pairs[0].value != "value" {
+t.Errorf("pair[0] wrong: %+v", pairs[0])
+}
+}
+
+// TestParseHeadersErrors covers all validation branches.
+func TestParseHeadersErrors(t *testing.T) {
+tests := []struct {
+input   string
+errFrag string
+}{
+{"NoColon", "expected"},
+{": emptyname", "empty"},
+{"X-Header: ", "empty"},
+{"X Header: val", "invalid character"},
+{"X-Header: val\r\ninjected: x", "illegal CR or LF"},
+{"Transfer-Encoding: chunked", "hop-by-hop"},
+}
+for _, tc := range tests {
+_, err := parseHeaders([]string{tc.input})
+if err == nil {
+t.Errorf("%q: expected error, got nil", tc.input)
+continue
+}
+if !strings.Contains(err.Error(), tc.errFrag) {
+t.Errorf("%q: error %q doesn't contain %q", tc.input, err.Error(), tc.errFrag)
+}
+}
+}
+
+// TestParseIgnoreHostsValid verifies hostname normalisation and wildcard support.
+func TestParseIgnoreHostsValid(t *testing.T) {
+m, err := parseIgnoreHosts([]string{"Login.Microsoft.com", "*.bbci.co.uk", "host:443"})
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+if !m["login.microsoft.com"] {
+t.Error("expected login.microsoft.com")
+}
+if !m[".bbci.co.uk"] {
+t.Error("expected .bbci.co.uk (wildcard)")
+}
+if !m["host"] {
+t.Error("expected host (port stripped)")
+}
+}
+
+// TestParseIgnoreHostsErrors covers validation error branches.
+func TestParseIgnoreHostsErrors(t *testing.T) {
+tests := []struct {
+input   string
+errFrag string
+}{
+{"https://example.com", "scheme"},
+{"example.com/path", "hostname"},
+}
+for _, tc := range tests {
+_, err := parseIgnoreHosts([]string{tc.input})
+if err == nil {
+t.Errorf("%q: expected error, got nil", tc.input)
+continue
+}
+if !strings.Contains(err.Error(), tc.errFrag) {
+t.Errorf("%q: error %q doesn't contain %q", tc.input, err.Error(), tc.errFrag)
+}
+}
+}
+
+// TestLoadReplaceFileValid verifies normal file parsing with comments and blanks.
+func TestLoadReplaceFileValid(t *testing.T) {
+tmp := t.TempDir()
+f := filepath.Join(tmp, "pairs.txt")
+os.WriteFile(f, []byte("# comment\nctf:acme\nctfd:foo\n\n"), 0o644)
+got, err := loadReplaceFile(f)
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+if got != "ctf:acme,ctfd:foo" {
+t.Errorf("got %q; want %q", got, "ctf:acme,ctfd:foo")
+}
+}
+
+// TestLoadReplaceFileInlineComment verifies inline '#' comment stripping.
+func TestLoadReplaceFileInlineComment(t *testing.T) {
+tmp := t.TempDir()
+f := filepath.Join(tmp, "pairs.txt")
+os.WriteFile(f, []byte("bbc:britcast # UK broadcaster\n"), 0o644)
+got, err := loadReplaceFile(f)
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+if got != "bbc:britcast" {
+t.Errorf("got %q; want %q", got, "bbc:britcast")
+}
+}
+
+// TestLoadReplaceFileMissing verifies error for non-existent file.
+func TestLoadReplaceFileMissing(t *testing.T) {
+_, err := loadReplaceFile("/nonexistent/path/pairs.txt")
+if err == nil {
+t.Error("expected error, got nil")
+}
+}
+
+// TestLoadReplaceFileBadLine verifies error for malformed pair.
+func TestLoadReplaceFileBadLine(t *testing.T) {
+tmp := t.TempDir()
+f := filepath.Join(tmp, "bad.txt")
+os.WriteFile(f, []byte("nocolon\n"), 0o644)
+_, err := loadReplaceFile(f)
+if err == nil {
+t.Error("expected error for invalid pair, got nil")
+}
+if !strings.Contains(err.Error(), "invalid pair") {
+t.Errorf("error %q doesn't mention 'invalid pair'", err.Error())
 }
 }
