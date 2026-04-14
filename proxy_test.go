@@ -1423,3 +1423,128 @@ func TestFollowTargetRedirects307(t *testing.T) {
 		t.Errorf("expected /final, got %q", capturedPath)
 	}
 }
+
+// TestFollowTargetRedirects301PostDowngrade verifies that a 301 redirect sent in
+// response to a POST request is followed with GET (browser behaviour: 301/302
+// POST → GET downgrade, 307/308 preserve the method).
+func TestFollowTargetRedirects301PostDowngrade(t *testing.T) {
+	var capturedMethod string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/post-target":
+			// 301 response to POST — transport should re-issue as GET
+			w.Header().Set("Location", "http://"+r.Host+"/final")
+			w.WriteHeader(http.StatusMovedPermanently)
+		case "/final":
+			capturedMethod = r.Method
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, "got-it")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	noRedirectClient := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	req, _ := http.NewRequest(http.MethodPost, ps.URL+"/post-target", strings.NewReader("body"))
+	req.Header.Set("Content-Type", "text/plain")
+	resp, err := noRedirectClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 after 301 follow, got %d", resp.StatusCode)
+	}
+	if capturedMethod != http.MethodGet {
+		t.Errorf("301 POST→GET downgrade: expected GET, got %q", capturedMethod)
+	}
+}
+
+// TestFollowAlsoProxyDomainRedirect verifies that a redirect to an alsoProxy
+// domain is followed server-side (same as same-root-domain redirects).
+func TestFollowAlsoProxyDomainRedirect(t *testing.T) {
+	// The "also-proxy" server that the redirect goes to.
+	var hitAlso int
+	alsoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitAlso++
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "also-done")
+	}))
+	defer alsoServer.Close()
+	alsoHost := strings.TrimPrefix(alsoServer.URL, "http://")
+
+	// Target server that issues a redirect to alsoHost.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://"+alsoHost+"/page")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer upstream.Close()
+
+	targetHost := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(targetHost, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, []string{alsoHost})
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	noRedirectClient := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := noRedirectClient.Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 after following alsoProxy redirect, got %d", resp.StatusCode)
+	}
+	if string(body) != "also-done" {
+		t.Errorf("expected 'also-done', got %q", body)
+	}
+	if hitAlso != 1 {
+		t.Errorf("expected alsoProxy server hit once, got %d", hitAlso)
+	}
+}
+
+// TestSDPathNoTrailingSlash verifies that a /__sd__/<host> path with no trailing
+// slash (and no path after the host) is handled correctly — the host is looked up
+// as-is without panicking or truncating a character from it.
+func TestSDPathNoTrailingSlash(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "root")
+	}))
+	defer upstream.Close()
+	upHost := strings.TrimPrefix(upstream.URL, "http://")
+
+	// Replace "up" → "alias" so we can verify ToOriginal runs on the host segment.
+	rep, _ := NewReplacer("up:alias", false)
+	proxy := NewReverseProxy("localhost", "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, []string{upHost})
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	// Request /__sd__/<aliasHost> with no trailing slash.
+	// upHost looks like "127.0.0.1:PORT" — use the verbatim form since rep only
+	// knows "up"→"alias" and won't match an IP; the important thing is that the
+	// code path for the no-slash branch executes without error.
+	resp, err := http.Get(ps.URL + "/__sd__/" + upHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d; body: %s", resp.StatusCode, body)
+	}
+}
