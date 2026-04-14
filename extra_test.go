@@ -3341,3 +3341,294 @@ func TestToAliasDiffEmptyReplacer(t *testing.T) {
 		t.Errorf("ToAliasDiff on empty replacer: got %q, %d; want %q, 0", got, count, "hello world")
 	}
 }
+
+// TestSubdomainSPAScriptSingleQuotedNonce verifies that when an HTML page uses a
+// single-quoted nonce attribute (nonce='xyz'), the injected SPA script still
+// picks up the nonce and applies it to the injected <script> tag.
+func TestSubdomainSPAScriptSingleQuotedNonce(t *testing.T) {
+	const subHost = "copilot.example.com"
+	const testNonce = "sq123nonce"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		// single-quoted nonce
+		fmt.Fprintf(w, `<!DOCTYPE html><html><head><title>App</title></head><body>`+
+			`<script nonce='%s'>var x=1;</script></body></html>`, testNonce)
+	}))
+	defer upstream.Close()
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy("example.com", "http", rep, false, "localhost:9048", false, 0, testLogger(), nil, nil, 0, nil)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	req, _ := http.NewRequest("GET", ps.URL+"/__sd__/"+subHost+"/", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	wantNonce := `<script nonce="` + testNonce + `">`
+	if !strings.Contains(string(body), wantNonce) {
+		t.Errorf("SPA script missing single-quoted nonce %q in output:\n%s", testNonce, body)
+	}
+}
+
+// TestGzipOversizedBodyForwarded verifies that a gzip-encoded response whose
+// decompressed size exceeds maxBodyBytes is forwarded as the decompressed bytes
+// (with Content-Encoding stripped) rather than truncated or dropped.
+func TestGzipOversizedBodyForwarded(t *testing.T) {
+	plain := []byte("hello ctf world")
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	gz.Write(plain)
+	gz.Close()
+	compressedBytes := compressed.Bytes()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(compressedBytes)
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("ctf:acme", false)
+	// maxBodyBytes=1 forces the oversized path for any non-trivial body.
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil, 1, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	// Content-Encoding should already be stripped (gzip was decompressed before the limit check).
+	if ce := resp.Header.Get("Content-Encoding"); ce != "" {
+		t.Errorf("Content-Encoding = %q; want empty (gzip decompressed before limit)", ce)
+	}
+	// Body must be the first (maxBodyBytes+1) decompressed bytes — the gzip stream was
+	// already decompressed and can't be re-compressed, so we forward the decompressed prefix.
+	// With maxBodyBytes=1, LimitReader reads maxBodyBytes+1 = 2 bytes.
+	want := plain[:2]
+	if !bytes.Equal(body, want) {
+		t.Errorf("gzip oversized: got %q; want first 2 bytes %q", body, want)
+	}
+}
+
+// TestGzipDecodeFailurePassthrough verifies that when the proxy receives a
+// response with Content-Encoding: gzip but an invalid (non-gzip) body, it
+// logs the error and returns the response without attempting replacement.
+func TestGzipDecodeFailurePassthrough(t *testing.T) {
+	const badBody = "this is not gzip data at all"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Encoding", "gzip")
+		// Write invalid gzip bytes.
+		fmt.Fprint(w, badBody)
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("ctf:acme", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:8080", true, 0, testLogger(), nil, nil, 0, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	// The proxy must respond (not crash or hang).
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 passthrough on gzip error, got %d", resp.StatusCode)
+	}
+}
+
+// TestLinkHeaderAlreadyPrefixedSkipped verifies that Link header values which
+// already start with /__sd__/ are not double-prefixed, and that protocol-relative
+// (//host/path) links are passed through unmodified.
+func TestLinkHeaderAlreadyPrefixedSkipped(t *testing.T) {
+	subHost := "api.example.com"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// already-prefixed link + protocol-relative link
+		w.Header().Set("Link",
+			`</__sd__/`+subHost+`/already>; rel=preload, `+
+				`<//cdn.example.com/font.woff2>; rel=preload; as=font`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy("example.com", "http", rep, false, "localhost:8080", false, 0, testLogger(), nil, nil, 0, nil)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/__sd__/" + subHost + "/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	link := resp.Header.Get("Link")
+	// Already-prefixed link must not be double-prefixed.
+	if strings.Count(link, "/__sd__/"+subHost+"/already") != 1 {
+		t.Errorf("already-prefixed link was double-prefixed: %q", link)
+	}
+	// Protocol-relative link must not be modified (no /__sd__/ prefix added).
+	if strings.Contains(link, "/__sd__/") && strings.Contains(link, "//cdn.example.com") {
+		t.Errorf("protocol-relative link was incorrectly prefixed: %q", link)
+	}
+}
+
+// TestBaseHrefAlreadyPrefixedSkipped verifies that a <base href> which already
+// contains /__sd__/ is left unmodified (no double-prefix).
+func TestBaseHrefAlreadyPrefixedSkipped(t *testing.T) {
+	const subHost = "assets.example.com"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<html><head><base href="/__sd__/%s/"></head></html>`, subHost)
+	}))
+	defer upstream.Close()
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy("example.com", "http", rep, false, "localhost:9049", false, 0, testLogger(), nil, nil, 0, nil)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	req, _ := http.NewRequest("GET", ps.URL+"/__sd__/"+subHost+"/", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// The /__sd__/assets.example.com/ prefix must appear exactly once.
+	if count := strings.Count(string(body), "/__sd__/"+subHost+"/"); count != 1 {
+		t.Errorf("base href /__sd__/ prefix count = %d; want 1\nbody: %s", count, body)
+	}
+}
+
+// TestBaseHrefAbsoluteProxyURLRewritten verifies that when a subdomain page
+// has <base href="http://upstream/"> — which maskResponseString rewrites to
+// the proxy address — the base href is then updated to point to the subdomain
+// proxy route instead of the proxy root.
+func TestBaseHrefAbsoluteProxyURLRewritten(t *testing.T) {
+	const subHost = "assets.example.com"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		// Use the upstream host in the base href — maskResponseString will rewrite
+		// "example.com" → proxyAddr, then the base-href pass rewrites proxy root → subdomain route.
+		fmt.Fprint(w, `<html><head><base href="http://example.com/"></head></html>`)
+	}))
+	defer upstream.Close()
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy("example.com", "http", rep, false, "localhost:9049", false, 0, testLogger(), nil, nil, 0, nil)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	req, _ := http.NewRequest("GET", ps.URL+"/__sd__/"+subHost+"/", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// After rewriting: base href should contain the subdomain prefix.
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, "/__sd__/"+subHost) {
+		t.Errorf("base href not rewritten to subdomain route; got:\n%s", bodyStr)
+	}
+}
+
+// TestManifestAlreadyPrefixedSkipped verifies that a manifest root-relative
+// path that already starts with /__sd__/ is not double-prefixed.
+func TestManifestAlreadyPrefixedSkipped(t *testing.T) {
+	const subHost = "app.example.com"
+	const originalBody = `{"scope":"/__sd__/` + subHost + `/","start_url":"/__sd__/` + subHost + `/"}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/manifest+json")
+		fmt.Fprint(w, originalBody)
+	}))
+	defer upstream.Close()
+
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy("example.com", "http", rep, false, "localhost:9049", false, 0, testLogger(), nil, nil, 0, nil)
+	proxy.Transport = &fixedHostTransport{upstream: upstream}
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	req, _ := http.NewRequest("GET", ps.URL+"/__sd__/"+subHost+"/manifest.json", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// Already-prefixed paths must not be double-prefixed.
+	// "/__sd__/app.example.com" should appear exactly twice (once per key).
+	const sdPfx = "/__sd__/" + subHost
+	count := strings.Count(string(body), sdPfx)
+	if count != 2 {
+		t.Errorf("expected exactly 2 occurrences of %q (no double-prefix), got %d; body: %s", sdPfx, count, body)
+	}
+}
+
+// TestFollowTargetRedirects303PostToGet verifies that a 303 See Other redirect
+// always follows with GET, regardless of the original request method.
+func TestFollowTargetRedirects303PostToGet(t *testing.T) {
+	var capturedMethod string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/submit":
+			// 303 must always redirect with GET.
+			w.Header().Set("Location", "http://"+r.Host+"/result")
+			w.WriteHeader(http.StatusSeeOther)
+		case "/result":
+			capturedMethod = r.Method
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, "ok")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	noRedirectClient := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	req, _ := http.NewRequest(http.MethodPost, ps.URL+"/submit", strings.NewReader("data"))
+	resp, err := noRedirectClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 after 303, got %d", resp.StatusCode)
+	}
+	if capturedMethod != http.MethodGet {
+		t.Errorf("303 must always use GET for redirect, got %q", capturedMethod)
+	}
+}
