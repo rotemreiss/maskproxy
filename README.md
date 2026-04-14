@@ -109,9 +109,9 @@ maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -insecure
 # Verbose logging to a file, loopback only, port 9001
 maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -verbose -log proxy.log -listen 127.0.0.1 -port 9001
 
-# Exclude an auth host and a wildcard CDN domain from rewriting
+# Exclude auth hosts from rewriting (their bundles contain strings that must not be touched)
 maskproxy -target microsoft.com -replace microsoft:msctf \
-  -ignore-host login.microsoftonline.com -ignore-host "*.bbci.co.uk"
+  -ignore-host login.microsoftonline.com -ignore-host login.live.com
 
 # Proxy a site that loads assets from a separate domain (BBC uses bbci.co.uk and bbc.co.uk)
 maskproxy -target www.bbc.com -replace bbc:britcast \
