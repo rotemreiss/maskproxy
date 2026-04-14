@@ -3734,3 +3734,61 @@ if capturedRawPath != "" && !strings.Contains(capturedRawPath, "foo") {
 t.Errorf("RawPath not de-aliased: %q", capturedRawPath)
 }
 }
+
+// TestInsecureTLSSkipsVerification verifies that when -skip-verify is set,
+// the proxy connects to an upstream with a self-signed TLS certificate without
+// returning an error (TLS certificate verification is skipped).
+func TestInsecureTLSSkipsVerification(t *testing.T) {
+upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+w.Header().Set("Content-Type", "text/plain")
+fmt.Fprint(w, "secure-ok")
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "https://")
+rep, _ := NewReplacer("", false)
+// insecure=true — must accept the self-signed test certificate.
+proxy := NewReverseProxy(host, "https", rep, true, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+resp, err := ps.Client().Get(ps.URL + "/")
+if err != nil {
+t.Fatalf("expected no TLS error with insecure=true, got: %v", err)
+}
+defer resp.Body.Close()
+body, _ := io.ReadAll(resp.Body)
+
+if resp.StatusCode != http.StatusOK {
+t.Errorf("expected 200, got %d", resp.StatusCode)
+}
+if string(body) != "secure-ok" {
+t.Errorf("expected 'secure-ok', got %q", body)
+}
+}
+
+// TestSecureTLSVerificationFails verifies that when insecure=false (default),
+// connecting to an upstream with a self-signed certificate causes a 502.
+func TestSecureTLSVerificationFails(t *testing.T) {
+upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+fmt.Fprint(w, "should-not-reach")
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "https://")
+rep, _ := NewReplacer("", false)
+// insecure=false — TLS cert verification must reject the self-signed cert.
+proxy := NewReverseProxy(host, "https", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+resp, err := ps.Client().Get(ps.URL + "/")
+if err != nil {
+t.Fatal(err)
+}
+defer resp.Body.Close()
+// Self-signed cert must cause a 502 Bad Gateway.
+if resp.StatusCode != http.StatusBadGateway {
+t.Errorf("expected 502 with TLS verification, got %d", resp.StatusCode)
+}
+}
