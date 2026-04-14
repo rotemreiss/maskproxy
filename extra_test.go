@@ -4400,3 +4400,48 @@ func TestFollowTargetRedirectSchemeLessLocation(t *testing.T) {
 		t.Error("expected redirect to /final to be followed")
 	}
 }
+
+// TestRewriteCSPRequireSRIForDropped verifies that the require-sri-for CSP
+// directive is completely dropped — exercising the name == "require-sri-for"
+// branch in rewriteCSP.
+func TestRewriteCSPRequireSRIForDropped(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", "script-src 'self'; require-sri-for script style; default-src 'self'")
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	rep, _ := NewReplacer("", false)
+	proxy := NewReverseProxy(host, "http", rep, false, "localhost:9801", true, 0, newDiscardLogger(), nil, nil, 0, nil)
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	resp, err := ps.Client().Get(ps.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	csp := resp.Header.Get("Content-Security-Policy")
+	if strings.Contains(csp, "require-sri-for") {
+		t.Errorf("require-sri-for should be stripped from CSP; got: %q", csp)
+	}
+	if !strings.Contains(csp, "default-src") {
+		t.Errorf("other CSP directives should be preserved; got: %q", csp)
+	}
+}
+
+// TestUnmaskRequestStringEmptySubHost verifies that unmaskRequestString handles
+// a URL where /__sd__/ has no host following it (subHost == "") without
+// entering an infinite loop — exercising the break guard.
+func TestUnmaskRequestStringEmptySubHost(t *testing.T) {
+	// A URL with /__sd__/ immediately followed by end-of-string has an empty subHost.
+	s := "http://localhost:9801/__sd__/"
+	got := unmaskRequestString(s, "example.com", "https", "localhost:9801")
+	// The /__sd__/ with empty host should be left as-is or normalised without panic.
+	// The important thing is it returns without infinite looping.
+	if got == "" {
+		t.Error("expected non-empty result from unmaskRequestString")
+	}
+}
