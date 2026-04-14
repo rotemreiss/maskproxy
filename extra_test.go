@@ -4631,3 +4631,44 @@ func TestSubdomainExplicitPortNotBlocked(t *testing.T) {
 		t.Errorf("expected cdn-content, got %q", string(body))
 	}
 }
+
+// TestSubdomainExplicitPortURLRewritten verifies that subdomainRe matches
+// subdomain URLs with explicit non-standard ports (e.g. :8443).
+// Before the fix, "[/?#...] boundary" didn't include ":" so the regex failed
+// to match "https://cdn.example.com:8443/file.js".
+func TestSubdomainExplicitPortURLRewritten(t *testing.T) {
+	rootDomain := "example.com"
+	// Build the same subdomainRe that NewReverseProxy would construct.
+	subdomainRe := regexp.MustCompile(
+		`(?i)((?:https?:)?//(?:[a-zA-Z0-9][-a-zA-Z0-9]*\.)+` +
+			regexp.QuoteMeta(rootDomain) +
+			`(?::\d+)?)([/?#"'\s` + "\x00" + `]|$)`,
+	)
+	proxyAddr := "localhost:9099"
+
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{
+			input: `<script src="https://cdn.example.com:8443/app.js"></script>`,
+			want:  `<script src="http://localhost:9099/__sd__/cdn.example.com:8443/app.js"></script>`,
+		},
+		{
+			input: `<script src="http://cdn.example.com:8080/app.js"></script>`,
+			want:  `<script src="http://localhost:9099/__sd__/cdn.example.com:8080/app.js"></script>`,
+		},
+		{
+			// No port — must still work.
+			input: `<script src="https://cdn.example.com/app.js"></script>`,
+			want:  `<script src="http://localhost:9099/__sd__/cdn.example.com/app.js"></script>`,
+		},
+	}
+
+	for _, tc := range cases {
+		got := maskResponseString(tc.input, "www.example.com", rootDomain, proxyAddr, subdomainRe, nil, nil)
+		if got != tc.want {
+			t.Errorf("input:  %s\ngot:    %s\nwant:   %s", tc.input, got, tc.want)
+		}
+	}
+}

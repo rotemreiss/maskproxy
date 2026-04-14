@@ -1576,7 +1576,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		subdomainRe = regexp.MustCompile(
 			`(?i)((?:https?:)?//(?:[a-zA-Z0-9][-a-zA-Z0-9]*\.)+` +
 				regexp.QuoteMeta(rootDomain) +
-				`)([/?#"'\s\x00]|$)`,
+				`(?::\d+)?)([/?#"'\s\x00]|$)`,
 		)
 	}
 
@@ -1613,7 +1613,7 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		}
 		if len(parts) > 0 {
 			alsoProxyRe = regexp.MustCompile(
-				`(?i)((?:https?:)?//(?:` + strings.Join(parts, "|") + `))([/?#"'\s\x00]|$)`,
+				`(?i)((?:https?:)?//(?:` + strings.Join(parts, "|") + `)(?::\d+)?)([/?#"'\s\x00]|$)`,
 			)
 		}
 	}
