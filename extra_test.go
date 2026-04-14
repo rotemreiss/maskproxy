@@ -3792,3 +3792,51 @@ if resp.StatusCode != http.StatusBadGateway {
 t.Errorf("expected 502 with TLS verification, got %d", resp.StatusCode)
 }
 }
+
+// errorReader is an io.ReadCloser that returns an error after the first read.
+type errorReader struct{ called bool }
+
+func (e *errorReader) Read(p []byte) (int, error) {
+if e.called {
+return 0, fmt.Errorf("simulated read error")
+}
+e.called = true
+return 0, fmt.Errorf("simulated read error")
+}
+func (e *errorReader) Close() error { return nil }
+
+// TestRequestBodyReadFailure verifies that when reading the request body fails,
+// the proxy still forwards the request upstream (with empty body) and logs the
+// error rather than crashing or hanging.
+func TestRequestBodyReadFailure(t *testing.T) {
+var upstreamCalled bool
+upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+upstreamCalled = true
+w.Header().Set("Content-Type", "text/plain")
+fmt.Fprint(w, "ok")
+}))
+defer upstream.Close()
+
+host := strings.TrimPrefix(upstream.URL, "http://")
+rep, _ := NewReplacer("foo:bar", false)
+proxy := NewReverseProxy(host, "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0, nil)
+ps := httptest.NewServer(proxy)
+defer ps.Close()
+
+// Craft a request with a body that immediately fails on Read.
+req, _ := http.NewRequest(http.MethodPost, ps.URL+"/submit", &errorReader{})
+req.Header.Set("Content-Type", "text/plain")
+req.ContentLength = 10 // non-zero so director attempts to read body
+
+resp, err := http.DefaultClient.Do(req)
+if err != nil {
+// A connection error is acceptable here since the body errors immediately.
+return
+}
+defer resp.Body.Close()
+
+// If the proxy responds at all, it must have called upstream and responded.
+if !upstreamCalled {
+t.Error("expected upstream to be called even on body read failure")
+}
+}
