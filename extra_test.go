@@ -4511,3 +4511,44 @@ func TestDirectorClientHostFallback(t *testing.T) {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
 	}
 }
+
+// TestParseIgnoreHostsEmptyTokenSkipped verifies that whitespace-only tokens
+// inside a comma-separated ignore-host string are silently skipped.
+func TestParseIgnoreHostsEmptyTokenSkipped(t *testing.T) {
+m, err := parseIgnoreHosts([]string{" , example.com, , "})
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+if !m["example.com"] {
+t.Errorf("expected example.com in map, got %v", m)
+}
+if len(m) != 1 {
+t.Errorf("expected 1 entry, got %d", len(m))
+}
+}
+
+// TestWSLoggingTransportBodyNotRWC verifies the !ok branch when the upstream
+// returns a 101 response whose Body does not implement io.ReadWriteCloser.
+func TestWSLoggingTransportBodyNotRWC(t *testing.T) {
+// Build a mock round-tripper that returns a 101 with a read-only body.
+inner := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+return &http.Response{
+StatusCode: http.StatusSwitchingProtocols,
+Proto:      "HTTP/1.1",
+// io.NopCloser wraps only an io.Reader — does NOT satisfy io.ReadWriteCloser.
+Body: io.NopCloser(strings.NewReader("")),
+}, nil
+})
+logger := &Logger{l: log.New(io.Discard, "", 0)}
+tr := &wsLoggingTransport{rt: inner, logger: logger}
+
+req, _ := http.NewRequest("GET", "http://example.com/", nil)
+resp, err := tr.RoundTrip(req)
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+// Proxy should return the response as-is (no panic, no logging).
+if resp.StatusCode != http.StatusSwitchingProtocols {
+t.Errorf("expected 101, got %d", resp.StatusCode)
+}
+}
