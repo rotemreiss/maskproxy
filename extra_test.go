@@ -4826,3 +4826,37 @@ func TestNewReverseProxyWithTrafficStore(t *testing.T) {
 		t.Errorf("expected status 200, got %d", txns[0].StatusCode)
 	}
 }
+
+// TestBuildReplacementPairs verifies the helper that extracts Pair metadata
+// from a Replacer for the UI traffic store.
+func TestBuildReplacementPairs(t *testing.T) {
+	// nil Replacer → nil slice.
+	if pairs := buildReplacementPairs(nil); pairs != nil {
+		t.Errorf("expected nil for nil replacer, got %v", pairs)
+	}
+
+	// Empty spec → nil slice.
+	rep, _ := NewReplacer("", false)
+	if pairs := buildReplacementPairs(rep); pairs != nil {
+		t.Errorf("expected nil for empty replacer, got %v", pairs)
+	}
+
+	// Non-empty spec → correct pairs extracted.
+	rep2, _ := NewReplacer("foo:bar,baz:qux", false)
+	pairs := buildReplacementPairs(rep2)
+	if len(pairs) != 2 {
+		t.Fatalf("expected 2 pairs, got %d", len(pairs))
+	}
+	// Pairs are sorted by descending length so longer match first.
+	// baz and foo have same length — order may vary; check contents by map.
+	got := map[string]string{}
+	for _, p := range pairs {
+		got[p.Original] = p.Alias
+	}
+	if got["foo"] != "bar" {
+		t.Errorf("expected foo→bar, got %v", got)
+	}
+	if got["baz"] != "qux" {
+		t.Errorf("expected baz→qux, got %v", got)
+	}
+}
