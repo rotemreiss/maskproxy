@@ -2210,7 +2210,14 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 		// rewrite root-relative paths so browsers resolve them against the subdomain
 		// /__sd__/ route rather than the proxy root.
 		reqHost := resp.Request.URL.Host
-		isSubdomain := !strings.EqualFold(reqHost, targetHost) && reqHost != ""
+		// isSubdomain is true when the response came from a subdomain host (e.g.
+		// api.example.com for a request that was proxied via /__sd__/api.example.com/).
+		// The root domain (e.g. "github.com" when targetHost="www.github.com") must
+		// NOT be treated as a subdomain — it's just the canonical form of the same
+		// target, which followTargetRedirectsTransport may have routed to.
+		isSubdomain := reqHost != "" &&
+			!strings.EqualFold(reqHost, targetHost) &&
+			!strings.EqualFold(reqHost, rootDomain)
 		if isSubdomain {
 			rewritten = rewriteRootRelativePaths(rewritten, reqHost)
 			// Rewrite <base href> so relative (non-root-relative) URLs resolve
