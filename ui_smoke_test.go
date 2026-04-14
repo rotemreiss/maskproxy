@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUIServerSmoke(t *testing.T) {
@@ -162,5 +163,63 @@ n, _ = resp.Body.Read(buf)
 got = string(buf[:n])
 if !strings.Contains(got, "sse-test.example.com") {
 t.Errorf("SSE event: expected host in payload, got %q", got)
+}
+}
+
+// TestTrafficStoreAll covers the ring-buffer wrap-around path in All().
+func TestTrafficStoreAll(t *testing.T) {
+store := NewTrafficStore()
+
+// Empty store → nil
+if got := store.All(); got != nil {
+t.Errorf("expected nil for empty store, got %v", got)
+}
+
+// Fill beyond maxTransactions to trigger the circular-buffer branch.
+for i := 0; i < maxTransactions+5; i++ {
+tx := store.NewTransaction()
+tx.Method = "GET"
+tx.Host = "example.com"
+store.Save(tx)
+}
+all := store.All()
+if len(all) != maxTransactions {
+t.Errorf("expected %d transactions, got %d", maxTransactions, len(all))
+}
+}
+
+// TestComputeStatsStatusCodes exercises all status-code buckets in ComputeStats.
+func TestComputeStatsStatusCodes(t *testing.T) {
+store := NewTrafficStore()
+
+codes := []int{200, 301, 404, 503, 0}
+for _, code := range codes {
+tx := store.NewTransaction()
+tx.StatusCode = code
+tx.Time = time.Now()
+store.Save(tx)
+}
+
+stats := store.ComputeStats()
+if stats.Total != len(codes) {
+t.Errorf("expected Total=%d, got %d", len(codes), stats.Total)
+}
+if stats.StatusCodes["2xx"] != 1 {
+t.Errorf("expected 1 2xx, got %d", stats.StatusCodes["2xx"])
+}
+if stats.StatusCodes["3xx"] != 1 {
+t.Errorf("expected 1 3xx, got %d", stats.StatusCodes["3xx"])
+}
+if stats.StatusCodes["4xx"] != 1 {
+t.Errorf("expected 1 4xx, got %d", stats.StatusCodes["4xx"])
+}
+if stats.StatusCodes["5xx"] != 1 {
+t.Errorf("expected 1 5xx, got %d", stats.StatusCodes["5xx"])
+}
+if stats.StatusCodes["other"] != 1 {
+t.Errorf("expected 1 other, got %d", stats.StatusCodes["other"])
+}
+if stats.ErrorRate == 0 {
+t.Errorf("expected non-zero error rate with 4xx/5xx transactions")
 }
 }
