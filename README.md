@@ -41,6 +41,7 @@ maskproxy -target <host> [options]
 | `-replace <pairs>` | Comma-separated `original:alias` pairs, e.g. `ctf:acme,ctfd:foo`. |
 | `-replace-file <path>` | File with one `original:alias` pair per line (`#` comments and blank lines ignored). Combined with `-replace`; CLI pairs win on conflict. |
 | `-ignore-host <hosts>` | Comma-separated upstream hostnames to exclude from all rewriting. Supports wildcard prefix `*.domain.com` to match any subdomain. Traffic still flows through the proxy but bodies and headers are passed through unchanged. Useful to protect hosts whose JS bundles contain strings that must not be touched (e.g. OAuth scope IDs). Repeatable. |
+| `-also-proxy <domains>` | Comma-separated extra domains (not subdomains of `-target`) that should be proxied through `/__sd__/<host>/` rather than fetched directly by the browser. Use when a site loads assets from an entirely different domain that also needs string replacement — e.g. `bbc.com` loads scripts from `bbc.co.uk`. Repeatable. |
 | `-cs` | Case-sensitive matching. Default is case-insensitive (`Microsoft`, `MICROSOFT`, `microsoft` all match). |
 
 ### Upstream connection
@@ -96,6 +97,10 @@ maskproxy -target ctf.io -replace ctf:acme,ctfd:foo -verbose -log proxy.log -lis
 # Exclude an auth host and a wildcard CDN domain from rewriting
 maskproxy -target microsoft.com -replace microsoft:msctf \
   -ignore-host login.microsoftonline.com -ignore-host "*.bbci.co.uk"
+
+# Proxy a site that loads assets from a separate domain (BBC uses bbci.co.uk and bbc.co.uk)
+maskproxy -target www.bbc.com -replace bbc:britcast \
+  -also-proxy bbci.co.uk,bbc.co.uk
 ```
 
 | Direction | Example |
@@ -126,6 +131,7 @@ maskproxy -target microsoft.com -replace microsoft:msctf \
 - **`text/event-stream` (SSE)** responses are streamed directly without buffering — headers are still rewritten.
 - **WebSocket** connections are transparently proxied. WS frames are not string-replaced (binary framing), but opcodes and payload lengths are logged to stderr by default (`-ws-no-log` suppresses this).
 - **Subdomain routing**: upstream subdomains are encoded as `/__sd__/<subdomain>/path` in the proxy URL so the browser never needs to know about them directly.
+- **`-also-proxy` extra-domain routing**: domains listed with `-also-proxy` that are not subdomains of the target are also routed through `/__sd__/<host>/`, enabling full rewriting for assets from entirely separate CDN or API domains.
 - **SSRF guard**: only subdomains of the configured root domain are allowed through `/__sd__/`; hostnames containing `@` or path separators are rejected with HTTP 400.
 - **Graceful shutdown**: Ctrl+C / SIGTERM drains in-flight requests for up to `-drain` seconds before exiting.
 - **Replacement count** is logged on every request/response line so you can confirm replacements are firing without enabling `-verbose`.
