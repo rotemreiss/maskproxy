@@ -1694,6 +1694,13 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 				subHost = rest[:i]
 				subPath = rest[i:]
 			}
+			// Un-replace any alias strings in the subHost before validation and routing.
+			// The response rewriter applied ToAlias to the /__sd__/<host> path, so
+			// "bbci.co.uk" in the response becomes "britcasti.co.uk" when the user
+			// has -replace bbc:britcast.  Reverse that here so we route to the real host.
+			if rep.HasPairs() {
+				subHost = rep.ToOriginal(subHost)
+			}
 			// Validate: subHost must be the rootDomain itself, or a subdomain of it.
 			// A valid subdomain satisfies: strings.HasSuffix(subHost, "."+rootDomain)
 			// OR subHost == rootDomain (bare root, no subdomain label).
