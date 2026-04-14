@@ -1249,3 +1249,39 @@ func TestParseHeaders(t *testing.T) {
 		})
 	}
 }
+
+// TestSdPathNotUnreplaced verifies that when the director handles a /__sd__/<host>/<path>
+// request, only the host segment has ToOriginal applied — not the path.
+// Regression: with -replace ynet:news, a request for
+//   /__sd__/<cdnHost>/static/newsRoomScript.js
+// was incorrectly forwarded as /static/ynetRoomScript.js (404 on CDN).
+func TestSdPathNotUnreplaced(t *testing.T) {
+	var capturedPath string
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstreamSrv.Close()
+
+	// upHost is e.g. "127.0.0.1:PORT" — add it to alsoProxy so the SSRF guard allows it.
+	// proxyAddr must be non-empty for alsoProxyDomains to be registered.
+	upHost := strings.TrimPrefix(upstreamSrv.URL, "http://")
+	rep, _ := NewReplacer("ynet:news", false)
+	proxy := NewReverseProxy("ynet.co.il", "http", rep, false, "localhost:9999", true, 0, testLogger(), nil, nil, 0,
+		[]string{upHost})
+	ps := httptest.NewServer(proxy)
+	defer ps.Close()
+
+	// The path contains "news" as part of a CDN filename — it must NOT be
+	// reversed to "ynet" by the director's ToOriginal pass.
+	resp, err := ps.Client().Get(ps.URL + "/__sd__/" + upHost + "/static/newsRoomScript.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if capturedPath != "/static/newsRoomScript.js" {
+		t.Errorf("path corrupted: got %q want %q", capturedPath, "/static/newsRoomScript.js")
+	}
+}

@@ -1691,9 +1691,24 @@ func NewReverseProxy(targetHost, scheme string, rep *Replacer, insecure bool, pr
 			}
 		}
 		if rep.HasPairs() && !ignored.contains(outboundHostForPath) {
-			req.URL.Path = rep.ToOriginal(req.URL.Path)
-			if req.URL.RawPath != "" {
-				req.URL.RawPath = rep.ToOriginal(req.URL.RawPath)
+			if strings.HasPrefix(req.URL.Path, subdomainPrefix) {
+				// For /__sd__/<host>/<path> requests, apply ToOriginal only to the
+				// host segment.  The path after the host is a real upstream path
+				// (CDN filenames, API routes, etc.) and must not be corrupted by
+				// alias reversal — e.g. "newsRoomScript.js" must not become
+				// "ynetRoomScript.js" just because "news" is the alias for "ynet".
+				rest := req.URL.Path[len(subdomainPrefix):]
+				if i := strings.Index(rest, "/"); i >= 0 {
+					req.URL.Path = subdomainPrefix + rep.ToOriginal(rest[:i]) + rest[i:]
+				} else {
+					req.URL.Path = subdomainPrefix + rep.ToOriginal(rest)
+				}
+				req.URL.RawPath = ""
+			} else {
+				req.URL.Path = rep.ToOriginal(req.URL.Path)
+				if req.URL.RawPath != "" {
+					req.URL.RawPath = rep.ToOriginal(req.URL.RawPath)
+				}
 			}
 			if req.URL.RawQuery != "" {
 				req.URL.RawQuery = rep.ToOriginal(req.URL.RawQuery)
